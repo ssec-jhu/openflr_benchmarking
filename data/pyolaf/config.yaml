@@ -1,0 +1,14 @@
+gridType: 'reg'
+focus: 'single'
+plenoptic: 1
+uLensMask: 1
+M: 10
+NA: 0.3000
+ftl: 200000
+fm: 1875
+tube2mla: 200000
+mla2sensor: 0
+lensPitch: 125
+pixelPitch: 6.5000
+WaveLength: 0.5250
+n: 1

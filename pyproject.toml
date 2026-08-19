@@ -1,0 +1,20 @@
+[project]
+name = "openflr-benchmarking"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fire>=0.7.1",
+
+
+]
+
+[tool.uv.sources]
+pyolaf = { git = "https://github.com/lambdaloop/pyolaf", tag = "v0.2.0" }
+
+[dependency-groups]
+olaf = [
+    "numba>=0.67.0",
+    "pyolaf",
+]
