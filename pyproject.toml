@@ -6,19 +6,18 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "fire>=0.7.1",
-]
-
-[tool.uv.sources]
-pyolaf = { git = "https://github.com/lambdaloop/pyolaf", tag = "v0.2.0" }
-flfm = { git = "https://github.com/OpenFLR/flfm.git" }
-
-[dependency-groups]
-olaf = [
-    "cupy-cuda12x[ctk]>=14.1.1",
-    "numba>=0.67.0",
-    "pyolaf",
-]
-openflr = [
     "flfm",
     "jax[cuda12]>=0.11.1",
+    "torch",
+    "torchvision",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+flfm = { git = "https://github.com/OpenFLR/flfm.git" }
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }

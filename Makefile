@@ -1,8 +1,3 @@
-olaf:
-	@echo "Running Olaf reconstruction..."
-	export CUDA_VISIBLE_DEVICES=0; \
-	uv run --group olaf main.py --use_olaf
-
 openflr-torch:
 	@echo "Running OpenFLR reconstruction..."
 	export FLFM_TIME_RECONSTRUCTION=1; \
