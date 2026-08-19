@@ -1,33 +1,26 @@
 
-from pathlib import Path
 import time
+from pathlib import Path
 
-import numpy as np
-from pyolaf.aliasing import lanczosfft, LFM_computeDepthAdaptiveWidth
-from pyolaf.geometry import LFM_computeGeometryParameters, LFM_setCameraParams
-from pyolaf.lf import LFM_computeLFMatrixOperators
-from pyolaf.project import LFM_forwardProject, LFM_backwardProject
-from pyolaf.transform import LFM_retrieveTransformation, format_transform, get_transformed_shape, transform_img
+import fire
 
+def main(
+    use_olaf:bool = False,
+    use_openflr:bool = False,
+    use_openflr_v2:bool = False,
+    open_flr_backend:str = "torch",
+):
+    if not any([use_olaf, use_openflr, use_openflr_v2]):
+        raise ValueError("At least one of use_olaf, use_openflr, or use_openflr_v2 must be True.")
 
-try:
-    import cupy
-    from cupy.fft import fftshift, ifft2, fft2
-    has_cupy = True
-except ImportError:
-    import numpy as cupy
-    from numpy.fft import fftshift, ifft2, fft2
-    has_cupy = False
+    if use_olaf:
+        run_olaf(Path(__file__).parent / "data" / "pyolaf")
 
-if has_cupy:
-    mempool = cupy.get_default_memory_pool()
-    mempool.set_limit(7.5 * 2**30)
+    if use_openflr:
+        run_openflr(Path(__file__).parent / "data" / "openflr", backend=open_flr_backend)
 
-
-
-def main():
-    data_location = Path(__file__).parent / "data" / "pyolaf"
-    run_olaf(data_location)
+    if use_openflr_v2:
+        run_openflr_v2(Path(__file__).parent / "data" / "openflr", backend=open_flr_backend)
 
 
 
@@ -43,9 +36,29 @@ def run_olaf(
     super_resolution_factor:int = 5,
     lanczos_window_size:int = 4,
     filter_flag:bool = True,
-    use_gpu:bool=False,
 ) -> None:
+    import numpy as np
     import tifffile
+    from pyolaf.aliasing import lanczosfft, LFM_computeDepthAdaptiveWidth
+    from pyolaf.geometry import LFM_computeGeometryParameters, LFM_setCameraParams
+    from pyolaf.lf import LFM_computeLFMatrixOperators
+    from pyolaf.project import LFM_forwardProject, LFM_backwardProject
+    from pyolaf.transform import LFM_retrieveTransformation, format_transform, get_transformed_shape, transform_img
+
+    try:
+        import cupy
+        from cupy.fft import fftshift, ifft2, fft2
+        has_cupy = True
+        print("cupy found!")
+    except ImportError:
+        import numpy as cupy
+        from numpy.fft import fftshift, ifft2, fft2
+        has_cupy = False
+        print("cupy not found, using numpy instead.")
+
+    if has_cupy:
+        mempool = cupy.get_default_memory_pool()
+        mempool.set_limit(7.5 * 2**30)
 
     calibration = Path(data_location) / "calib.tif"
     config = Path(data_location) / "config.yaml"
@@ -100,7 +113,7 @@ def run_olaf(
     lf_image = cupy.asarray(lf_image)
     recon_volume = cupy.asarray(np.copy(init_volume))
 
-    start = time.time()
+    start = time.perf_counter()
 
     for i in range(n_iters):
         if i == 0:
@@ -131,15 +144,25 @@ def run_olaf(
     else:
         recon_volume_np = recon_volume
 
-    print(f"Finished {n_iters} iterations in {time.time() - start:.2f} seconds.")
+    completed_time = time.perf_counter() - start
 
-    import matplotlib.pyplot as plt
 
-    plt.figure(1)
-    plt.clf()
-    plt.imshow(recon_volume_np[:, :, 0])
-    plt.draw()
-    plt.show()
+def run_openflr(data_path:str|Path, backend:str)-> None:
+    """Runs openflr reconstruction on the given data path using the specified backend.
+
+    Set the timing variable to a truthy variable and set the backend to either "torch" or "jax"
+    FLFM_TIME_RECONSTRUCTION=1 uv run --group openflr main.py --use_openflr
+    """
+    import flfm.io
+    import flfm.restoration
+
+    data_path = Path(data_path)
+    image = flfm.io.open(data_path / "light_field_image.tif")
+    psf = flfm.io.open(data_path / "measured_psf.tif")
+    psf_norm = psf / flfm.restoration.sum(psf)
+    reconstruction = flfm.restoration.reconstruct(image, psf_norm, recon_kwargs=dict())
+
+
 
 if __name__ == "__main__":
-    main()
+    fire.Fire(main)
