@@ -251,6 +251,7 @@ def main(
         guess = torch.ones_like(psf).to("cuda") * 0.5
 
         if use_openflr:
+            torch.cuda.synchronize()
             times = []
             for _ in range(n_iters):
                 start = time.perf_counter()
