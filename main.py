@@ -21,11 +21,11 @@ PSF = np.ndarray
 # jax.config.update("jax_log_compiles", True)
 
 def open_image(path:str|Path)-> np.ndarray:
-    img = Image.open(path)
-    frames = []
-    for i in range(img.n_frames):
-        img.seek(i)
-        frames.append(np.array(img))
+    with Image.open(path) as img:
+        frames = []
+        for i in range(img.n_frames):
+            img.seek(i)
+            frames.append(np.array(img))
 
     return np.stack(frames, axis=0) # [n_frames, h, w]
 
@@ -187,8 +187,8 @@ def main(
     use_openflr_v2:bool = False,
     n_iters:int = 20,
 ):
-    if not use_openflr ^ use_openflr_v2:
-        raise ValueError("At least one of use_olaf, use_openflr, or use_openflr_v2 must be True.")
+    if use_openflr == use_openflr_v2:
+        raise ValueError("Exactly one of use_openflr and use_openflr_v2 must be True.")
 
     img, psf = get_data("data/openflr")
 
