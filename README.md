@@ -1,6 +1,4 @@
 # openflr_benchmarking
 
-
-## pyolaf notes
-
-Get the data for the examples ![here](https://drive.google.com/drive/folders/1clAUjal3P0a2owQrwGvdpUAoCHYwSecb?usp=share_link):
+to run the benchmarks make sure the gpu is in the 0 position and run the
+command `make all`.
