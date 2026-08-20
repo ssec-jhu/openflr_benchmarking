@@ -21,11 +21,11 @@ PSF = np.ndarray
 # jax.config.update("jax_log_compiles", True)
 
 def open_image(path:str|Path)-> np.ndarray:
-    img = Image.open(path)
-    frames = []
-    for i in range(img.n_frames):
-        img.seek(i)
-        frames.append(np.array(img))
+    with Image.open(path) as img:
+        frames = []
+        for i in range(img.n_frames):
+            img.seek(i)
+            frames.append(np.array(img))
 
     return np.stack(frames, axis=0) # [n_frames, h, w]
 
