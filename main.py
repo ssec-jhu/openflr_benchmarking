@@ -187,8 +187,8 @@ def main(
     use_openflr_v2:bool = False,
     n_iters:int = 20,
 ):
-    if not use_openflr ^ use_openflr_v2:
-        raise ValueError("At least one of use_olaf, use_openflr, or use_openflr_v2 must be True.")
+    if use_openflr == use_openflr_v2:
+        raise ValueError("Exactly one of use_openflr and use_openflr_v2 must be True.")
 
     img, psf = get_data("data/openflr")
 
