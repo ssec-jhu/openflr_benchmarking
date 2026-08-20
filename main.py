@@ -264,6 +264,7 @@ def main(
                 torch.cuda.synchronize()
                 times.append(time.perf_counter() - start)
         else:
+            torch.cuda.synchronize()
             psft_fft = torch.fft.rfft2(torch.fft.ifftshift(torch.flip(psf, dims=(-2, -1)), dim=(-2, -1))).to("cuda")
             times = []
             for _ in range(n_iters):
