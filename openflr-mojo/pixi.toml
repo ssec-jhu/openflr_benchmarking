@@ -1,0 +1,20 @@
+[workspace]
+authors = ["Ryan Hausen <ryan.hausen@gmail.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "openflr-mojo"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+prepare-data = { cmd = "../.venv/bin/python3 prepare_data.py", description = "Convert the OpenFLR TIFFs into raw float32 binaries" }
+test-fft-cpu = "mojo run src/test_fft.mojo && mojo run src/test_fft2.mojo"
+test-fft-gpu = "mojo run src/test_fft_gpu.mojo && mojo run src/test_fft2_gpu.mojo"
+test-openflr-cpu = "mojo run src/test_openflr.mojo"
+test-openflr-gpu = "mojo run src/test_openflr_gpu.mojo"
+test = { depends-on = ["test-fft-cpu", "test-fft-gpu", "test-openflr-cpu", "test-openflr-gpu"] }
+run-v1 = "mojo run src/main.mojo -- v1 20"
+run-v2 = "mojo run src/main.mojo -- v2 20"
+
+[dependencies]
+mojo = ">=1.1.0.dev2026082405,<2"
+max = ">=26.6.0.dev2026082405,<27"

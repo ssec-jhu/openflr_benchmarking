@@ -1,0 +1,5 @@
+.pixi/
+__mojocache__/
+data/*.bin
+data/shape.txt
+*.bin
