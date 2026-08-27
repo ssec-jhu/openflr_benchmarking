@@ -8,7 +8,7 @@ version = "0.1.0"
 [tasks]
 prepare-data = { cmd = "../.venv/bin/python3 prepare_data.py", description = "Convert the OpenFLR TIFFs into raw float32 binaries" }
 test-fft-cpu = "mojo run src/test_fft.mojo && mojo run src/test_fft2.mojo"
-test-fft-gpu = "mojo run src/test_fft_gpu.mojo && mojo run src/test_fft2_gpu.mojo"
+test-fft-gpu = "mojo run src/test_fft_gpu.mojo && mojo run src/test_fft2_gpu.mojo && mojo run src/test_fft_gpu_radix4.mojo"
 test-openflr-cpu = "mojo run src/test_openflr.mojo"
 test-openflr-gpu = "mojo run src/test_openflr_gpu.mojo"
 test = { depends-on = ["test-fft-cpu", "test-fft-gpu", "test-openflr-cpu", "test-openflr-gpu"] }

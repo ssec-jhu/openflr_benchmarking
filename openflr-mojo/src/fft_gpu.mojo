@@ -9,6 +9,7 @@ GPUs).
 
 from std.math import cos, sin, ceildiv
 from std.gpu import thread_idx, block_idx
+from std.gpu.primitives.warp import shuffle_xor, WARP_SIZE
 from max.gpu.sync import barrier
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
@@ -54,37 +55,276 @@ def fft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
 
-    # Bit-reversed load: thread `tid` fills slots `tid` and `tid + half`.
-    var src0 = bit_reverse_ct(tid, log2n)
-    var src1 = bit_reverse_ct(tid + half, log2n)
-    s_re[tid] = rebind[Scalar[DType.float32]](re[row, src0])
-    s_im[tid] = rebind[Scalar[DType.float32]](im[row, src0])
-    s_re[tid + half] = rebind[Scalar[DType.float32]](re[row, src1])
-    s_im[tid + half] = rebind[Scalar[DType.float32]](im[row, src1])
-    barrier()
-
     comptime sign: Float32 = 1.0 if invert else -1.0
-    comptime for stage in range(log2n):
-        comptime size = 1 << (stage + 1)
-        comptime stage_half = size // 2
-        var group = tid // stage_half
-        var k = tid % stage_half
-        var i0 = group * size + k
-        var i1 = i0 + stage_half
-        var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
-        var xr = s_re[i1]
-        var xi = s_im[i1]
-        var tr = xr * wr - xi * wi
-        var ti = xr * wi + xi * wr
-        var ur = s_re[i0]
-        var ui = s_im[i0]
-        s_re[i0] = ur + tr
-        s_im[i0] = ui + ti
-        s_re[i1] = ur - tr
-        s_im[i1] = ui - ti
+
+    comptime if N >= 64 and WARP_SIZE == 32:
+        # Warp-local fast path: the first 6 butterfly stages (stage_half =
+        # 1, 2, 4, 8, 16, 32) only ever combine data within a single warp's
+        # own 64-element block of the array (see optimizations.md for the
+        # index-algebra proof: i0 XOR i1 == stage_half always, and every
+        # group of `size <= 64` elements is threaded by <= 32 consecutive
+        # tids, which is exactly one warp since 64 == 2*WARP_SIZE). Doing
+        # these stages via register-resident values + `shuffle_xor` instead
+        # of shared memory removes 6 `barrier()`s (and the shared-memory
+        # traffic for the first 6 stages) from every row FFT of this
+        # kernel -- roughly half the stages for the production N=2048 case
+        # (log2n=11). Verified bit-exact against the shared-memory-only
+        # path via the existing test suite.
+        var warp = tid // 32
+        var lane = tid % 32
+        var pos_a = 64 * warp + lane
+        var pos_b = pos_a + 32
+        var src_a = bit_reverse_ct(pos_a, log2n)
+        var src_b = bit_reverse_ct(pos_b, log2n)
+        var a_re = rebind[Scalar[DType.float32]](re[row, src_a])
+        var a_im = rebind[Scalar[DType.float32]](im[row, src_a])
+        var b_re = rebind[Scalar[DType.float32]](re[row, src_b])
+        var b_im = rebind[Scalar[DType.float32]](im[row, src_b])
+
+        comptime for stage in range(5):
+            comptime stage_half = 1 << stage
+            comptime size = stage_half * 2
+            var k = lane & (stage_half - 1)
+            var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            # Branchless role select: `(lane >> stage) & 1` is 0 for the
+            # "lo" (i0) role, 1 for "hi" (i1). Computing both candidate
+            # results and blending by a 0/1 float mask avoids an `if/else`
+            # here, which would otherwise diverge within the warp (half the
+            # lanes idle while the other half executes) -- on this hardware
+            # that divergence measured far more expensive than the
+            # shared-memory + barrier() it was meant to replace (see
+            # optimizations.md).
+            var lo_f = Float32(1 - ((lane >> stage) & 1))
+            var hi_f = 1.0 - lo_f
+
+            var pa_re = shuffle_xor(a_re, UInt32(stage_half))
+            var pa_im = shuffle_xor(a_im, UInt32(stage_half))
+            var a_lo_tr = pa_re * wr - pa_im * wi
+            var a_lo_ti = pa_re * wi + pa_im * wr
+            var a_hi_tr = a_re * wr - a_im * wi
+            var a_hi_ti = a_re * wi + a_im * wr
+            var new_a_re_s = lo_f * (a_re + a_lo_tr) + hi_f * (pa_re - a_hi_tr)
+            var new_a_im_s = lo_f * (a_im + a_lo_ti) + hi_f * (pa_im - a_hi_ti)
+            a_re = new_a_re_s
+            a_im = new_a_im_s
+
+            var pb_re = shuffle_xor(b_re, UInt32(stage_half))
+            var pb_im = shuffle_xor(b_im, UInt32(stage_half))
+            var b_lo_tr = pb_re * wr - pb_im * wi
+            var b_lo_ti = pb_re * wi + pb_im * wr
+            var b_hi_tr = b_re * wr - b_im * wi
+            var b_hi_ti = b_re * wi + b_im * wr
+            var new_b_re_s = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
+            var new_b_im_s = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
+            b_re = new_b_re_s
+            b_im = new_b_im_s
+
+        # stage_half = 32 (size = 64): `a` and `b` are this same thread's
+        # own two registers (idx_a's bit 5 is always 0, idx_b's always 1),
+        # so this combine is a pure local computation -- no shuffle needed.
+        var angle32 = sign * 2.0 * PI * Float32(lane) / 64.0
+        var wr32 = cos(angle32)
+        var wi32 = sin(angle32)
+        var tr32 = b_re * wr32 - b_im * wi32
+        var ti32 = b_re * wi32 + b_im * wr32
+        var new_a_re = a_re + tr32
+        var new_a_im = a_im + ti32
+        var new_b_re = a_re - tr32
+        var new_b_im = a_im - ti32
+
+        s_re[pos_a] = new_a_re
+        s_im[pos_a] = new_a_im
+        s_re[pos_b] = new_b_re
+        s_im[pos_b] = new_b_im
         barrier()
+
+        # Radix-4 fused pairs: two chained radix-2 DIT stages rewritten
+        # algebraically as one radix-4 stage (see optimizations.md
+        # "Higher-radix FFT stages"), halving the barrier()/shared-memory
+        # round trips for these large-stride stages. Only N/4 of the N/2
+        # launched threads do work per fused stage (each produces 4 outputs
+        # instead of 2); the rest idle until the shared barrier(). A
+        # leftover odd stage (when log2n - 6 is odd) runs as a plain
+        # radix-2 stage afterward.
+        comptime num_pairs6 = (log2n - 6) // 2
+        comptime for pair_i in range(num_pairs6):
+            comptime stage0 = 6 + 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = N // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = sign * 2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = sign * 2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = -sign * tci
+                var t1i = sign * tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if (log2n - 6) % 2 == 1:
+            comptime stage = log2n - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
+    else:
+        # Bit-reversed load: thread `tid` fills slots `tid` and `tid + half`.
+        var src0 = bit_reverse_ct(tid, log2n)
+        var src1 = bit_reverse_ct(tid + half, log2n)
+        s_re[tid] = rebind[Scalar[DType.float32]](re[row, src0])
+        s_im[tid] = rebind[Scalar[DType.float32]](im[row, src0])
+        s_re[tid + half] = rebind[Scalar[DType.float32]](re[row, src1])
+        s_im[tid + half] = rebind[Scalar[DType.float32]](im[row, src1])
+        barrier()
+
+        # Same radix-4 fusion as the fast-path tail above, applied to the
+        # full stage range (used when N < 64, so no warp-shuffle fast path
+        # is available).
+        comptime num_pairs0 = log2n // 2
+        comptime for pair_i in range(num_pairs0):
+            comptime stage0 = 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = N // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = sign * 2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = sign * 2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = -sign * tci
+                var t1i = sign * tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if log2n % 2 == 1:
+            comptime stage = log2n - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
 
     comptime if invert:
         comptime inv_n: Float32 = 1.0 / Float32(N)
@@ -123,36 +363,242 @@ def rfft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
-    # Pack: z[n] = x[2n] + j*x[2n+1], bit-reversed load into shared memory.
-    var src0 = bit_reverse_ct(tid, log2h)
-    var src1 = bit_reverse_ct(tid + half2, log2h)
-    s_re[tid] = rebind[Scalar[DType.float32]](x[row, 2 * src0])
-    s_im[tid] = rebind[Scalar[DType.float32]](x[row, 2 * src0 + 1])
-    s_re[tid + half2] = rebind[Scalar[DType.float32]](x[row, 2 * src1])
-    s_im[tid + half2] = rebind[Scalar[DType.float32]](x[row, 2 * src1 + 1])
-    barrier()
+    comptime if half >= 64 and WARP_SIZE == 32:
+        # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
+        # for the index-algebra proof), applied to this kernel's internal
+        # length-`half` complex FFT.
+        var warp = tid // 32
+        var lane = tid % 32
+        var pos_a = 64 * warp + lane
+        var pos_b = pos_a + 32
+        var src_a = bit_reverse_ct(pos_a, log2h)
+        var src_b = bit_reverse_ct(pos_b, log2h)
+        var a_re = rebind[Scalar[DType.float32]](x[row, 2 * src_a])
+        var a_im = rebind[Scalar[DType.float32]](x[row, 2 * src_a + 1])
+        var b_re = rebind[Scalar[DType.float32]](x[row, 2 * src_b])
+        var b_im = rebind[Scalar[DType.float32]](x[row, 2 * src_b + 1])
 
-    comptime for stage in range(log2h):
-        comptime size = 1 << (stage + 1)
-        comptime stage_half = size // 2
-        var group = tid // stage_half
-        var k = tid % stage_half
-        var i0 = group * size + k
-        var i1 = i0 + stage_half
-        var angle = -2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
-        var xr = s_re[i1]
-        var xi = s_im[i1]
-        var tr = xr * wr - xi * wi
-        var ti = xr * wi + xi * wr
-        var ur = s_re[i0]
-        var ui = s_im[i0]
-        s_re[i0] = ur + tr
-        s_im[i0] = ui + ti
-        s_re[i1] = ur - tr
-        s_im[i1] = ui - ti
+        comptime for stage in range(5):
+            comptime stage_half = 1 << stage
+            comptime size = stage_half * 2
+            var k = lane & (stage_half - 1)
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var lo_f = Float32(1 - ((lane >> stage) & 1))
+            var hi_f = 1.0 - lo_f
+
+            var pa_re = shuffle_xor(a_re, UInt32(stage_half))
+            var pa_im = shuffle_xor(a_im, UInt32(stage_half))
+            var a_lo_tr = pa_re * wr - pa_im * wi
+            var a_lo_ti = pa_re * wi + pa_im * wr
+            var a_hi_tr = a_re * wr - a_im * wi
+            var a_hi_ti = a_re * wi + a_im * wr
+            a_re = lo_f * (a_re + a_lo_tr) + hi_f * (pa_re - a_hi_tr)
+            a_im = lo_f * (a_im + a_lo_ti) + hi_f * (pa_im - a_hi_ti)
+
+            var pb_re = shuffle_xor(b_re, UInt32(stage_half))
+            var pb_im = shuffle_xor(b_im, UInt32(stage_half))
+            var b_lo_tr = pb_re * wr - pb_im * wi
+            var b_lo_ti = pb_re * wi + pb_im * wr
+            var b_hi_tr = b_re * wr - b_im * wi
+            var b_hi_ti = b_re * wi + b_im * wr
+            b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
+            b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
+
+        var angle32 = -2.0 * PI * Float32(lane) / 64.0
+        var wr32 = cos(angle32)
+        var wi32 = sin(angle32)
+        var tr32 = b_re * wr32 - b_im * wi32
+        var ti32 = b_re * wi32 + b_im * wr32
+        var new_a_re = a_re + tr32
+        var new_a_im = a_im + ti32
+        var new_b_re = a_re - tr32
+        var new_b_im = a_im - ti32
+
+        s_re[pos_a] = new_a_re
+        s_im[pos_a] = new_a_im
+        s_re[pos_b] = new_b_re
+        s_im[pos_b] = new_b_im
         barrier()
+
+        # Radix-4 fused pairs (forward transform, sign = -1); see
+        # `fft_row_kernel`'s tail loop for the derivation.
+        comptime num_pairs6 = (log2h - 6) // 2
+        comptime for pair_i in range(num_pairs6):
+            comptime stage0 = 6 + 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = tci
+                var t1i = -tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if (log2h - 6) % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
+    else:
+        # Pack: z[n] = x[2n] + j*x[2n+1], bit-reversed load into shared memory.
+        var src0 = bit_reverse_ct(tid, log2h)
+        var src1 = bit_reverse_ct(tid + half2, log2h)
+        s_re[tid] = rebind[Scalar[DType.float32]](x[row, 2 * src0])
+        s_im[tid] = rebind[Scalar[DType.float32]](x[row, 2 * src0 + 1])
+        s_re[tid + half2] = rebind[Scalar[DType.float32]](x[row, 2 * src1])
+        s_im[tid + half2] = rebind[Scalar[DType.float32]](x[row, 2 * src1 + 1])
+        barrier()
+
+        # Same radix-4 fusion, full stage range (used when `half` < 64).
+        comptime num_pairs0 = log2h // 2
+        comptime for pair_i in range(num_pairs0):
+            comptime stage0 = 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = tci
+                var t1i = -tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if log2h % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
 
     # Unpack Z (length `half`, in shared memory) into the length-N half
     # spectrum X[0 .. half] via the even/odd DFT symmetry.
@@ -207,37 +653,243 @@ def rfft_row_kernel_div[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
-    # Pack: z[n] = x[2n] + j*x[2n+1] where x = a / b, bit-reversed load into
-    # shared memory.
-    var src0 = bit_reverse_ct(tid, log2h)
-    var src1 = bit_reverse_ct(tid + half2, log2h)
-    s_re[tid] = rebind[Scalar[DType.float32]](a[row, 2 * src0]) / rebind[Scalar[DType.float32]](b[row, 2 * src0])
-    s_im[tid] = rebind[Scalar[DType.float32]](a[row, 2 * src0 + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src0 + 1])
-    s_re[tid + half2] = rebind[Scalar[DType.float32]](a[row, 2 * src1]) / rebind[Scalar[DType.float32]](b[row, 2 * src1])
-    s_im[tid + half2] = rebind[Scalar[DType.float32]](a[row, 2 * src1 + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src1 + 1])
-    barrier()
+    comptime if half >= 64 and WARP_SIZE == 32:
+        # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
+        # for the index-algebra proof), applied to this kernel's internal
+        # length-`half` complex FFT of `a / b`.
+        var warp = tid // 32
+        var lane = tid % 32
+        var pos_a_idx = 64 * warp + lane
+        var pos_b_idx = pos_a_idx + 32
+        var src_a = bit_reverse_ct(pos_a_idx, log2h)
+        var src_b = bit_reverse_ct(pos_b_idx, log2h)
+        var a_re = rebind[Scalar[DType.float32]](a[row, 2 * src_a]) / rebind[Scalar[DType.float32]](b[row, 2 * src_a])
+        var a_im = rebind[Scalar[DType.float32]](a[row, 2 * src_a + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src_a + 1])
+        var b_re = rebind[Scalar[DType.float32]](a[row, 2 * src_b]) / rebind[Scalar[DType.float32]](b[row, 2 * src_b])
+        var b_im = rebind[Scalar[DType.float32]](a[row, 2 * src_b + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src_b + 1])
 
-    comptime for stage in range(log2h):
-        comptime size = 1 << (stage + 1)
-        comptime stage_half = size // 2
-        var group = tid // stage_half
-        var k = tid % stage_half
-        var i0 = group * size + k
-        var i1 = i0 + stage_half
-        var angle = -2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
-        var xr = s_re[i1]
-        var xi = s_im[i1]
-        var tr = xr * wr - xi * wi
-        var ti = xr * wi + xi * wr
-        var ur = s_re[i0]
-        var ui = s_im[i0]
-        s_re[i0] = ur + tr
-        s_im[i0] = ui + ti
-        s_re[i1] = ur - tr
-        s_im[i1] = ui - ti
+        comptime for stage in range(5):
+            comptime stage_half = 1 << stage
+            comptime size = stage_half * 2
+            var k = lane & (stage_half - 1)
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var lo_f = Float32(1 - ((lane >> stage) & 1))
+            var hi_f = 1.0 - lo_f
+
+            var pa_re = shuffle_xor(a_re, UInt32(stage_half))
+            var pa_im = shuffle_xor(a_im, UInt32(stage_half))
+            var a_lo_tr = pa_re * wr - pa_im * wi
+            var a_lo_ti = pa_re * wi + pa_im * wr
+            var a_hi_tr = a_re * wr - a_im * wi
+            var a_hi_ti = a_re * wi + a_im * wr
+            a_re = lo_f * (a_re + a_lo_tr) + hi_f * (pa_re - a_hi_tr)
+            a_im = lo_f * (a_im + a_lo_ti) + hi_f * (pa_im - a_hi_ti)
+
+            var pb_re = shuffle_xor(b_re, UInt32(stage_half))
+            var pb_im = shuffle_xor(b_im, UInt32(stage_half))
+            var b_lo_tr = pb_re * wr - pb_im * wi
+            var b_lo_ti = pb_re * wi + pb_im * wr
+            var b_hi_tr = b_re * wr - b_im * wi
+            var b_hi_ti = b_re * wi + b_im * wr
+            b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
+            b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
+
+        var angle32 = -2.0 * PI * Float32(lane) / 64.0
+        var wr32 = cos(angle32)
+        var wi32 = sin(angle32)
+        var tr32 = b_re * wr32 - b_im * wi32
+        var ti32 = b_re * wi32 + b_im * wr32
+        var new_a_re = a_re + tr32
+        var new_a_im = a_im + ti32
+        var new_b_re = a_re - tr32
+        var new_b_im = a_im - ti32
+
+        s_re[pos_a_idx] = new_a_re
+        s_im[pos_a_idx] = new_a_im
+        s_re[pos_b_idx] = new_b_re
+        s_im[pos_b_idx] = new_b_im
         barrier()
+
+        # Radix-4 fused pairs (forward transform, sign = -1); see
+        # `fft_row_kernel`'s tail loop for the derivation.
+        comptime num_pairs6 = (log2h - 6) // 2
+        comptime for pair_i in range(num_pairs6):
+            comptime stage0 = 6 + 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = tci
+                var t1i = -tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if (log2h - 6) % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
+    else:
+        # Pack: z[n] = x[2n] + j*x[2n+1] where x = a / b, bit-reversed load into
+        # shared memory.
+        var src0 = bit_reverse_ct(tid, log2h)
+        var src1 = bit_reverse_ct(tid + half2, log2h)
+        s_re[tid] = rebind[Scalar[DType.float32]](a[row, 2 * src0]) / rebind[Scalar[DType.float32]](b[row, 2 * src0])
+        s_im[tid] = rebind[Scalar[DType.float32]](a[row, 2 * src0 + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src0 + 1])
+        s_re[tid + half2] = rebind[Scalar[DType.float32]](a[row, 2 * src1]) / rebind[Scalar[DType.float32]](b[row, 2 * src1])
+        s_im[tid + half2] = rebind[Scalar[DType.float32]](a[row, 2 * src1 + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * src1 + 1])
+        barrier()
+
+        # Same radix-4 fusion, full stage range (used when `half` < 64).
+        comptime num_pairs0 = log2h // 2
+        comptime for pair_i in range(num_pairs0):
+            comptime stage0 = 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = tci
+                var t1i = -tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if log2h % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = -2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
 
     # Unpack Z (length `half`, in shared memory) into the length-N half
     # spectrum X[0 .. half] via the even/odd DFT symmetry.
@@ -286,50 +938,290 @@ def irfft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
-    # Reconstruct Z = Xe + j*Xo (length `half`) from the half spectrum,
-    # writing it bit-reversed into shared memory for the inverse FFT below.
-    for i in range(2):
-        var k = tid + i * half2
-        var idx = half - k
-        var ar = rebind[Scalar[DType.float32]](in_re[row, k])
-        var ai = rebind[Scalar[DType.float32]](in_im[row, k])
-        var br = rebind[Scalar[DType.float32]](in_re[row, idx])
-        var bi = -rebind[Scalar[DType.float32]](in_im[row, idx])
-        var er = (ar + br) * 0.5
-        var ei = (ai + bi) * 0.5
-        var dr = (ar - br) * 0.5
-        var di = (ai - bi) * 0.5
-        var angle = 2.0 * PI * Float32(k) / Float32(N)
-        var wr = cos(angle)
-        var wi = sin(angle)
-        var or_ = dr * wr - di * wi
-        var oi_ = dr * wi + di * wr
-        var dst = bit_reverse_ct(k, log2h)
-        s_re[dst] = er - oi_
-        s_im[dst] = ei + or_
-    barrier()
+    comptime if half >= 64 and WARP_SIZE == 32:
+        # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
+        # for the index-algebra proof). The "reconstruct" step below is a
+        # scatter (source index `k`, destination `bit_reverse(k)`) rather
+        # than a gather, but bit-reversal is self-inverse, so the value that
+        # ends up owning final position `pos` is simply the reconstruction
+        # of `k = bit_reverse(pos)` -- the same gather shape as the other
+        # kernels' fast paths.
+        var warp = tid // 32
+        var lane = tid % 32
+        var pos_a = 64 * warp + lane
+        var pos_b = pos_a + 32
 
-    comptime for stage in range(log2h):
-        comptime size = 1 << (stage + 1)
-        comptime stage_half = size // 2
-        var group = tid // stage_half
-        var k = tid % stage_half
-        var i0 = group * size + k
-        var i1 = i0 + stage_half
-        var angle = 2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
-        var xr = s_re[i1]
-        var xi = s_im[i1]
-        var tr = xr * wr - xi * wi
-        var ti = xr * wi + xi * wr
-        var ur = s_re[i0]
-        var ui = s_im[i0]
-        s_re[i0] = ur + tr
-        s_im[i0] = ui + ti
-        s_re[i1] = ur - tr
-        s_im[i1] = ui - ti
+        var ka = bit_reverse_ct(pos_a, log2h)
+        var idxa = half - ka
+        var aar = rebind[Scalar[DType.float32]](in_re[row, ka])
+        var aai = rebind[Scalar[DType.float32]](in_im[row, ka])
+        var abr = rebind[Scalar[DType.float32]](in_re[row, idxa])
+        var abi = -rebind[Scalar[DType.float32]](in_im[row, idxa])
+        var aer = (aar + abr) * 0.5
+        var aei = (aai + abi) * 0.5
+        var adr = (aar - abr) * 0.5
+        var adi = (aai - abi) * 0.5
+        var aangle = 2.0 * PI * Float32(ka) / Float32(N)
+        var awr = cos(aangle)
+        var awi = sin(aangle)
+        var aor = adr * awr - adi * awi
+        var aoi = adr * awi + adi * awr
+        var a_re = aer - aoi
+        var a_im = aei + aor
+
+        var kb = bit_reverse_ct(pos_b, log2h)
+        var idxb = half - kb
+        var bar = rebind[Scalar[DType.float32]](in_re[row, kb])
+        var bai = rebind[Scalar[DType.float32]](in_im[row, kb])
+        var bbr = rebind[Scalar[DType.float32]](in_re[row, idxb])
+        var bbi = -rebind[Scalar[DType.float32]](in_im[row, idxb])
+        var ber = (bar + bbr) * 0.5
+        var bei = (bai + bbi) * 0.5
+        var bdr = (bar - bbr) * 0.5
+        var bdi = (bai - bbi) * 0.5
+        var bangle = 2.0 * PI * Float32(kb) / Float32(N)
+        var bwr = cos(bangle)
+        var bwi = sin(bangle)
+        var bor = bdr * bwr - bdi * bwi
+        var boi = bdr * bwi + bdi * bwr
+        var b_re = ber - boi
+        var b_im = bei + bor
+
+        comptime for stage in range(5):
+            comptime stage_half = 1 << stage
+            comptime size = stage_half * 2
+            var k = lane & (stage_half - 1)
+            var angle = 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var lo_f = Float32(1 - ((lane >> stage) & 1))
+            var hi_f = 1.0 - lo_f
+
+            var pa_re = shuffle_xor(a_re, UInt32(stage_half))
+            var pa_im = shuffle_xor(a_im, UInt32(stage_half))
+            var a_lo_tr = pa_re * wr - pa_im * wi
+            var a_lo_ti = pa_re * wi + pa_im * wr
+            var a_hi_tr = a_re * wr - a_im * wi
+            var a_hi_ti = a_re * wi + a_im * wr
+            a_re = lo_f * (a_re + a_lo_tr) + hi_f * (pa_re - a_hi_tr)
+            a_im = lo_f * (a_im + a_lo_ti) + hi_f * (pa_im - a_hi_ti)
+
+            var pb_re = shuffle_xor(b_re, UInt32(stage_half))
+            var pb_im = shuffle_xor(b_im, UInt32(stage_half))
+            var b_lo_tr = pb_re * wr - pb_im * wi
+            var b_lo_ti = pb_re * wi + pb_im * wr
+            var b_hi_tr = b_re * wr - b_im * wi
+            var b_hi_ti = b_re * wi + b_im * wr
+            b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
+            b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
+
+        var angle32 = 2.0 * PI * Float32(lane) / 64.0
+        var wr32 = cos(angle32)
+        var wi32 = sin(angle32)
+        var tr32 = b_re * wr32 - b_im * wi32
+        var ti32 = b_re * wi32 + b_im * wr32
+        var new_a_re = a_re + tr32
+        var new_a_im = a_im + ti32
+        var new_b_re = a_re - tr32
+        var new_b_im = a_im - ti32
+
+        s_re[pos_a] = new_a_re
+        s_im[pos_a] = new_a_im
+        s_re[pos_b] = new_b_re
+        s_im[pos_b] = new_b_im
         barrier()
+
+        # Radix-4 fused pairs (inverse transform, sign = +1); see
+        # `fft_row_kernel`'s tail loop for the derivation.
+        comptime num_pairs6 = (log2h - 6) // 2
+        comptime for pair_i in range(num_pairs6):
+            comptime stage0 = 6 + 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = 2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = 2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = -tci
+                var t1i = tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if (log2h - 6) % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
+    else:
+        # Reconstruct Z = Xe + j*Xo (length `half`) from the half spectrum,
+        # writing it bit-reversed into shared memory for the inverse FFT below.
+        for i in range(2):
+            var k = tid + i * half2
+            var idx = half - k
+            var ar = rebind[Scalar[DType.float32]](in_re[row, k])
+            var ai = rebind[Scalar[DType.float32]](in_im[row, k])
+            var br = rebind[Scalar[DType.float32]](in_re[row, idx])
+            var bi = -rebind[Scalar[DType.float32]](in_im[row, idx])
+            var er = (ar + br) * 0.5
+            var ei = (ai + bi) * 0.5
+            var dr = (ar - br) * 0.5
+            var di = (ai - bi) * 0.5
+            var angle = 2.0 * PI * Float32(k) / Float32(N)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var or_ = dr * wr - di * wi
+            var oi_ = dr * wi + di * wr
+            var dst = bit_reverse_ct(k, log2h)
+            s_re[dst] = er - oi_
+            s_im[dst] = ei + or_
+        barrier()
+
+        # Same radix-4 fusion, full stage range (used when `half` < 64).
+        comptime num_pairs0 = log2h // 2
+        comptime for pair_i in range(num_pairs0):
+            comptime stage0 = 2 * pair_i
+            comptime m = 1 << (stage0 + 1)
+            comptime half_m = m // 2
+            comptime span = 2 * m
+            comptime num_tasks = half // 4
+            if tid < num_tasks:
+                var group = tid // half_m
+                var k = tid % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
+
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
+
+                var angle_a = 2.0 * PI * Float32(k) / Float32(m)
+                var war = cos(angle_a)
+                var wai = sin(angle_a)
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
+
+                var angle0 = 2.0 * PI * Float32(k) / Float32(span)
+                var w0r = cos(angle0)
+                var w0i = sin(angle0)
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = -tci
+                var t1i = tcr
+
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
+            barrier()
+
+        comptime if log2h % 2 == 1:
+            comptime stage = log2h - 1
+            comptime size = 1 << (stage + 1)
+            comptime stage_half = size // 2
+            var group = tid // stage_half
+            var k = tid % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle = 2.0 * PI * Float32(k) / Float32(size)
+            var wr = cos(angle)
+            var wi = sin(angle)
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
+            barrier()
 
     comptime inv_half: Float32 = 1.0 / Float32(half)
     for i in range(2):
