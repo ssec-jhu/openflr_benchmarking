@@ -139,6 +139,7 @@ def main() raises:
     var version = "v2"
     var n_iters = 20
     var dump_path = ""
+    var dump_tw = False
     var i = 1
     while i < len(args):
         var a = String(args[i])
@@ -149,6 +150,8 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
+        elif a == "--tw":
+            dump_tw = True
         else:
             n_iters = Int(a)
         i += 1
@@ -175,44 +178,76 @@ def main() raises:
     var out_buf = ctx.enqueue_create_buffer[DType.float32](N)
     var scratch = OpenFlrScratch[D, H, W](ctx)
 
-    if version == "v1":
-        run_v1_step_gpu[D, H, W, TILE](
-            ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
-        )
-    else:
-        run_v2_step_gpu[D, H, W, TILE](
-            ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
-        )
-    ctx.synchronize()
-
     if dump_path != "":
+        # One step, dumped for `verify_correctness.py`. Both twiddle
+        # strategies are dumped from the same entry point so the harness can
+        # check each against numpy: `--tw` picks the table.
+        if dump_tw:
+            if version == "v1":
+                run_v1_step_gpu[D, H, W, TILE, True](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+                )
+            else:
+                run_v2_step_gpu[D, H, W, TILE, True](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+                )
+        else:
+            if version == "v1":
+                run_v1_step_gpu[D, H, W, TILE, False](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+                )
+            else:
+                run_v2_step_gpu[D, H, W, TILE, False](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+                )
+        ctx.synchronize()
         var result = download[N](ctx, out_buf)
         write_floats(dump_path, result, N)
         print("wrote", dump_path)
         return
 
-    var times: List[Float64] = []
-    for _ in range(n_iters):
-        var start = perf_counter_ns()
+    # Benchmark both twiddle strategies in one invocation: `TW=False` is the
+    # inline per-thread `cos`/`sin` the kernels have always used, `TW=True`
+    # the shared twiddle table. Same process, same clocks, same warmed-up
+    # data, so the two numbers are directly comparable -- and the whole A/B
+    # costs one batch job on a cluster where interactive tuning is not an
+    # option.
+    comptime for tw_i in range(2):
+        comptime TW = tw_i == 1
+
         if version == "v1":
-            run_v1_step_gpu[D, H, W, TILE](
+            run_v1_step_gpu[D, H, W, TILE, TW](
                 ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
             )
         else:
-            run_v2_step_gpu[D, H, W, TILE](
+            run_v2_step_gpu[D, H, W, TILE, TW](
                 ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
             )
         ctx.synchronize()
-        var elapsed = Float64(perf_counter_ns() - start) / 1.0e9
-        times.append(elapsed)
-        var tmp = data_buf
-        data_buf = out_buf
-        out_buf = tmp
 
-    var stats = mean_std(times^, n_iters)
-    print(
-        "backend: mojo, version:", version,
-        ", mean time:", stats[0], "s, std time:", stats[1], "s",
-        file=stderr,
-    )
-    print(stats[0], "\\pm", stats[1])
+        var times: List[Float64] = []
+        for _ in range(n_iters):
+            var start = perf_counter_ns()
+            if version == "v1":
+                run_v1_step_gpu[D, H, W, TILE, TW](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+                )
+            else:
+                run_v2_step_gpu[D, H, W, TILE, TW](
+                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+                )
+            ctx.synchronize()
+            var elapsed = Float64(perf_counter_ns() - start) / 1.0e9
+            times.append(elapsed)
+            var tmp = data_buf
+            data_buf = out_buf
+            out_buf = tmp
+
+        var label = "on " if TW else "off"
+        var stats = mean_std(times^, n_iters)
+        print(
+            "backend: mojo, version:", version, ", twiddle table:", label,
+            ", mean time:", stats[0], "s, std time:", stats[1], "s",
+            file=stderr,
+        )
+        print("twiddle_table=" + label, stats[0], "\\pm", stats[1])

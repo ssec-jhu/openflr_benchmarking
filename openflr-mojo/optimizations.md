@@ -1799,3 +1799,157 @@ bit-identical. Part 1's negative result is the opposite: it is a statement
 about this GPU's DRAM organization and cache capacity, and rocFFT's tile shape
 may well be right on the parts rocFFT is tuned for. Anyone porting this to
 H100 should re-run the sweep rather than inherit the `TILE=32` conclusion.
+
+# Session: A100 profile — the FFT kernels are compute-bound there, and the twiddle table is back (behind `TW`)
+
+Brief: the pipeline was finally measured on the A100 the published
+`results.md` numbers come from (`nsys`, 1 warmup + 3 timed v2 iterations,
+`mojo_v2_a100.nsys-rep`). Every prior session in this log was measured on
+gfx1151. The A100 trace says the two machines are bottlenecked on *different
+things*, which invalidates the priority order the rest of this file ends on.
+
+## 0. Headline: the FFT kernels stopped scaling with bandwidth
+
+Steady-state v2 iteration from the trace (dispatches 23–36), against this
+file's sec. 2 gfx1151 table and the same byte model:
+
+| kernel | gfx µs | A100 µs | speedup | A100 GB/s | % of 2039 |
+|---|---|---|---|---|---|
+| `rfft_row_kernel` (W) | 6407 | 2297 | **2.79x** | 600 | 29% |
+| `transpose` (H,W2)→(W2,H) | 8993 | 1021 | 8.81x | 1349 | 66% |
+| `fft_row_kernel` (H fwd) | 7019 | 3042 | **2.31x** | 453 | 22% |
+| `complex_mul_kernel` | 9707 | 1162 | 8.35x | 1778 | 87% |
+| `sum_over_depth_kernel` | 3211 | 449 | 7.15x | 1569 | 77% |
+| small (1,H,W) × 6 | 985 | 406 | **2.43x** | 582 | 29% |
+| `ifft_row_cmul_broadcast` | 8146 | 4376 | **1.86x** | 319 | 16% |
+| `transpose` (W2,H)→(H,W2) | 9475 | 1094 | 8.66x | 1259 | 62% |
+| `irfft_row_mul_kernel` | 9179 | 3713 | **2.47x** | 556 | 27% |
+| **total** | **63122** | **17558** | 3.59x | 682 | 33% |
+
+The A100/gfx1151 bandwidth ratio is 8.0x theoretical, 8.8x against the
+232 GB/s achievable figure sec. 0 measured. The split is clean:
+
+- **Every kernel with no FFT butterfly in it scaled 7.2–8.8x** — the
+  bandwidth ratio. Those are bandwidth-bound on both machines and are
+  already done. `complex_mul_kernel` at 1778 GB/s is 87% of theoretical,
+  which incidentally hands us the A100's achievable-bandwidth number
+  without a separate streaming benchmark.
+- **Every kernel containing an FFT butterfly scaled only 1.9–2.8x** and
+  sits at 16–29% of peak. Those are no longer bandwidth-bound.
+
+Those kernels are **79% of the A100 iteration** (13.8 of 17.6 ms).
+
+The mechanism is that the two GPUs have opposite compute:bandwidth balance.
+A100 is 19.5 TFLOPS FP32; the Radeon 8060S is ~15 TFLOPS without dual-issue
+and ~30 with. So the A100 has *roughly the same* FP32 throughput as this
+iGPU while having 8x the DRAM bandwidth. Sec. 0's framing — "moving fewer
+bytes is the only lever with a big payoff" — is a gfx1151 statement, and it
+is false on the A100.
+
+**Occupancy is not the problem, contrary to the first guess.** `nsys`
+records registers and shared memory per dispatch: `fft_row_kernel` is 1024
+threads, 31 regs, 16 KB LDS, so two blocks fit per SM by every limit at once
+(31744 ≤ 32768 regs, 32 ≤ 164 KB shared, 2048 = the per-SM thread ceiling).
+That is 100% occupancy. The launch timeline is gap-free too, so dispatch
+overhead is not it either.
+
+**Consequence for the plan this file previously ended on.** Sec. 4(c)
+row-pitch padding targets transposes now running at 62–66% of peak (~0.6 ms
+available). Fusion (d) targets `complex_mul` + `sum_over_depth`, 1.61 ms
+combined and both already near the ceiling (~0.5 ms available). Together
+~6% on the A100, against the ~11% and ~20% they were worth on gfx1151.
+Neither is the top item any more.
+
+## 1. Arithmetic: the per-thread transcendentals are the size of the gap
+
+`fft_row_kernel` at N=2048 evaluates 11 `cos`/`sin` pairs per thread —
+6 in `fft_warp_head`, 4 across the two fused radix-4 stages, 1 in the
+leftover odd stage. At 42025 blocks × 1024 threads that is 1.35e6 warps ×
+22 transcendentals; at ~40 instructions per `std.math` Float32 `cos`/`sin`
+that is 1.18e9 warp-instructions, and A100 issues 6.09e11/s
+(108 SM × 4 schedulers × 1.41 GHz) → **~1.9 ms of the kernel's measured
+3.04 ms**. LDS bandwidth is not the constraint by comparison: the same row
+schedule moves ~5.5 GB of LDS traffic per dispatch against an A100 ceiling
+near 19.5 TB/s, about 9% utilization.
+
+That estimate is what motivated re-landing a twiddle table, which this log
+records as tried and reverted twice. Both earlier attempts were measured on
+a GPU where these kernels ran at 196–215 GB/s against a 232 GB/s ceiling —
+i.e. memory-bound with transcendental throughput to spare — and one of them
+was explicitly diagnosed as paying for the table out of occupancy.
+
+## 2. What was built
+
+A shared-memory twiddle table, gated on a compile-time `TW: Bool` that
+threads from `main.mojo` down through the host functions to the kernels,
+defaulted `False` everywhere so the tests and the non-transposed
+`rfft2`/`irfft2` variants are untouched.
+
+- **One table serves everything.** Every butterfly here wants
+  `exp(sign·2πi·k/L)` for a power-of-two stage length `L` dividing the
+  transform length `N`, which equals `exp(sign·2πi·(k·(N//L))/N)`. So a
+  single `N`-point table of `exp(-2πi·j/N)`, `j ∈ [0, N/2)`, covers every
+  stage of every kernel in both directions — the inverse direction is the
+  same table conjugated. `twiddle[N, L, TW, invert]` is the one lookup;
+  all 34 former `cos`/`sin` sites call it. It also covers the rfft/irfft
+  recombination pass, which wants `L = N` exactly.
+- **Filled by the block, into LDS.** `N/2` entries over `N/2` or `N/4`
+  threads: one or two `cos`/`sin` per thread, replacing the eleven each
+  thread used to evaluate walking the stage schedule. 8.26 KB at N=2048,
+  taking the biggest kernels from 16 to 24.26 KB — still inside the 48 KB
+  default per-block limit, and free in occupancy terms on a GPU whose
+  blocks are capped by threads and registers (sec. 0).
+- **A bank-conflict skew is essential, not a refinement.** Stage `s` reads
+  the table at stride `N >> (s+1)`: at N=2048, stage 4 is stride 64 and the
+  stage-32 combine is stride 32, which unskewed put 16 and 32 lanes of a
+  warp on bank 0. `tw_idx(j) = j + (j >> 5)` makes the stage-32 read stride
+  33 words, so its banks are `33·lane % 32 == lane`, all distinct; every
+  shallower stage spreads the same way. Without this the lookup would have
+  cost more than the `cos`/`sin` it replaces.
+- **`main.mojo` benchmarks both arms in one process**, so the A/B is a
+  single batch job on a cluster with no interactive access. `--dump --tw`
+  dumps the table variant for `verify_correctness.py`.
+
+## 3. Correctness
+
+At full scale (41, 2048, 2048), both versions, against the numpy reference:
+
+| | max abs vs numpy | mean abs |
+|---|---|---|
+| original code | 8.583e-06 | 2.396e-06 |
+| `TW=False` | 8.583e-06 | 2.396e-06 |
+| `TW=True` | 8.583e-06 | 2.396e-06 |
+
+`TW=False` is **bit-identical** to the pre-change code — the fallback
+evaluates the original `sign·2π·k/L` expression in the original Float32
+association, so the A/B's baseline arm is genuinely the old kernel.
+`TW=True` differs from it by at most 2.861e-06, a third of the gap either
+one has to numpy, and lands on exactly the same error against numpy. The
+full `pixi run test` suite passes.
+
+Not covered: the `WARP_SIZE != 32` / `half < 64` fallback branches with
+`TW=True`. `comptime if` does not type-check the untaken branch, and at
+N=2048 on any 32-wide-warp GPU the warp-shuffle path is always the one
+taken, so those edits are unexercised. They are dead at production sizes;
+the risk is a compile error on a wave64 device, not a silent wrong answer.
+
+## 4. Measured: neutral on gfx1151, untested on A100
+
+| | table off | table on | delta |
+|---|---|---|---|
+| v1 | 0.07298 s | 0.07268 s | −0.4% |
+| v2 | 0.06225 s | 0.06191 s | −0.6% |
+
+Neutral, as sec. 1 predicts it must be: on this GPU the kernels the table
+touches are already at 85–93% of achievable bandwidth, so deleting
+arithmetic behind a memory stall buys nothing. Worth noting it does not
+*lose* here either, unlike both earlier attempts — the skew and the free
+LDS at these block sizes are the difference.
+
+**The A100 is the test, and it has not been run.** If sec. 1's estimate is
+right, the four FFT-bearing dispatches should give up most of ~1.9 ms each
+of transcendental time. If the table measures neutral there too, the
+estimate is wrong and the 1.9–2.8x scaling deficit is something other than
+transcendental throughput — which is itself the more valuable finding,
+because it would redirect at the barrier/latency structure of the row
+schedule rather than its arithmetic.

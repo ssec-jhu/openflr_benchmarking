@@ -135,7 +135,7 @@ def sum_over_depth_real_kernel[
 
 
 def run_v1_step_gpu[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut data_buf: DeviceBuffer[DType.float32],
@@ -173,14 +173,14 @@ def run_v1_step_gpu[
     # dispatches become three, moving 2/3 of the bytes. `psf_fft_*` is
     # precomputed in the same transposed layout (free -- PSF prep is outside
     # the timed loop). See optimizations.md sec. 3(a).
-    rfft_w_transposed_gpu[D, H, W, TILE](
+    rfft_w_transposed_gpu[D, H, W, TILE, TW](
         ctx, data_buf, scratch.t_re_dhw2, scratch.t_im_dhw2,
         scratch.data_fft_re, scratch.data_fft_im,
     )
-    fft_col_cmul_ifft_gpu[D, H, W](
+    fft_col_cmul_ifft_gpu[D, H, W, TW](
         ctx, scratch.t_re_dhw2, scratch.t_im_dhw2, psf_fft_re, psf_fft_im,
     )
-    irfft_w_from_transposed_gpu[D, H, W, TILE](
+    irfft_w_from_transposed_gpu[D, H, W, TILE, TW](
         ctx, scratch.t_re_dhw2, scratch.t_im_dhw2, scratch.conv,
         scratch.data_fft_re, scratch.data_fft_im,
     )
@@ -196,7 +196,7 @@ def run_v1_step_gpu[
     # of materializing image_buf / denom into a separate img_err buffer
     # first, and leaving the result in the transposed (1, W/2+1, H) layout
     # its consumer below wants.
-    rfft2_batched_gpu_div_t[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
+    rfft2_batched_gpu_div_t[1, H, W, TILE, TW](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
 
     # Fused: the whole tail of the update -- `data * fftshift(irfft2(err_fft
     # * psft_fft))` -- computed by irfft2_batched_gpu_cmul_broadcast_mul_t in
@@ -210,14 +210,14 @@ def run_v1_step_gpu[
     # or read back (sec. 3(c)) -- SHIFT=True rotates the destination index.
     # `scratch.prod2_re`/`scratch.prod2_im` are reused as the fused
     # function's internal scratch.
-    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, True](
+    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, True, TW](
         ctx, scratch.err_fft_re, scratch.err_fft_im, psft_fft_re, psft_fft_im,
         data_buf, out_buf, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
     )
 
 
 def run_v2_step_gpu[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut data_buf: DeviceBuffer[DType.float32],
@@ -247,7 +247,7 @@ def run_v2_step_gpu[
     # depth reduction, both of which commute with a transpose of the last two
     # axes. `psf_fft_*` is precomputed transposed to match. See
     # optimizations.md sec. 3(a).
-    rfft2_batched_gpu_t[D, H, W, TILE](ctx, data_buf, scratch.data_fft_re, scratch.data_fft_im, scratch.t_re_dhw2, scratch.t_im_dhw2)
+    rfft2_batched_gpu_t[D, H, W, TILE, TW](ctx, data_buf, scratch.data_fft_re, scratch.data_fft_im, scratch.t_re_dhw2, scratch.t_im_dhw2)
 
     comptime cmul = complex_mul_kernel[type_of(layout_dhw2)]
     ctx.enqueue_function[cmul](
@@ -264,14 +264,14 @@ def run_v2_step_gpu[
         Int32(D), Int32(HW2), grid_dim=ceildiv(HW2, BLOCK_1D), block_dim=BLOCK_1D,
     )
 
-    irfft2_batched_gpu_t[1, H, W, TILE](ctx, scratch.reduce_re, scratch.reduce_im, scratch.denom, scratch.t_re_hw2, scratch.t_im_hw2)
+    irfft2_batched_gpu_t[1, H, W, TILE, TW](ctx, scratch.reduce_re, scratch.reduce_im, scratch.denom, scratch.t_re_hw2, scratch.t_im_hw2)
 
     # Fused: rfft2(image_buf / denom) computed directly by
     # rfft2_batched_gpu_div_t, dividing at the row-FFT's load stage instead
     # of materializing image_buf / denom into a separate img_err buffer
     # first, and leaving the result in the transposed (1, W/2+1, H) layout
     # its consumer below wants.
-    rfft2_batched_gpu_div_t[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
+    rfft2_batched_gpu_div_t[1, H, W, TILE, TW](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
 
     # Fused: the whole tail of the update -- `data * irfft2(err_fft *
     # psft_fft)` -- computed by irfft2_batched_gpu_cmul_broadcast_mul_t in
@@ -279,7 +279,7 @@ def run_v2_step_gpu[
     # fusion removes. v2 applies no fftshift, hence SHIFT=False.
     # `scratch.prod2_re`/`scratch.prod2_im` are reused as the fused
     # function's internal scratch.
-    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, False](
+    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, False, TW](
         ctx, scratch.err_fft_re, scratch.err_fft_im, psft_fft_re, psft_fft_im,
         data_buf, out_buf, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
     )

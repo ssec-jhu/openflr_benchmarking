@@ -37,7 +37,135 @@ def bit_reverse_ct(x: Int, bits: Int) -> Int:
     return result
 
 
-def fft_warp_head[invert: Bool](
+# --- Shared-memory twiddle table -------------------------------------------
+#
+# Every butterfly in this file wants `exp(sign * 2*pi*i * k / L)` for some
+# power-of-two stage length `L` dividing the transform length `N`, with
+# `k < L/2`. That equals `exp(sign * 2*pi*i * (k * (N//L)) / N)`, so a
+# single `N`-point table of `exp(-2*pi*i*j/N)` for `j` in `[0, N/2)` serves
+# every stage of every kernel here, in both directions (the inverse
+# direction is the same table conjugated). Callers pass `j = k * (N // L)`.
+#
+# The table is built once per block, by the block, into shared memory: one
+# `cos`/`sin` pair per entry, `N/2` entries over `N/2` or `N/4` threads, so
+# each thread evaluates one or two -- replacing the eleven it used to
+# evaluate inline walking the stage schedule. See `fill_twiddle_table` for
+# why paying shared memory for this is a different trade on an A100 than it
+# was on the GPU optimizations.md measured.
+
+
+def tw_entries(N: Int) -> Int:
+    """Logical twiddle count for a length-`N` transform."""
+    return N // 2
+
+
+def tw_idx(j: Int) -> Int:
+    """Physical slot for logical twiddle index `j`, skewed by `j >> 5` to
+    break shared-memory bank conflicts.
+
+    Every stage reads the table at a power-of-two stride: stage `s` of the
+    warp head wants `j = k * (N >> (s+1))` with `k = lane & (2^s - 1)`, so
+    at `N = 2048` stage 4 reads stride 64 and the stage-32 combine reads
+    stride 32. Unskewed, those put 16 and 32 lanes of a warp on bank 0 --
+    a 16- and 32-way conflict that would cost more than the `cos`/`sin`
+    pair the table exists to replace. Adding `j >> 5` makes the stage-32
+    read stride 33 words, whose banks are `33*lane % 32 == lane`, all
+    distinct; every shallower stage's stride spreads the same way."""
+    return j + (j >> 5)
+
+
+def tw_alloc(N: Int, TW: Bool) -> Int:
+    """Physical length to allocate for the table, skew included -- or 1 when
+    the table is off, so a `TW=False` build keeps exactly the shared-memory
+    footprint (and therefore the occupancy) it had before the table
+    existed."""
+    if not TW:
+        return 1
+    return tw_entries(N) + (tw_entries(N) >> 5) + 1
+
+
+def fill_twiddle_table[N: Int, TW: Bool](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    tid: Int,
+    nthreads: Int,
+):
+    """Fills the block's twiddle table and barriers. No-op when `TW` is off.
+
+    Costs `N/2` complex entries of shared memory -- 8.25 KB at `N = 2048`,
+    skew included. That is free on hardware whose occupancy is capped by
+    threads or registers rather than shared memory: an A100 runs these
+    1024-thread blocks two to an SM (the per-SM thread ceiling) at 31
+    registers each, well inside both the 64 K register file and the 164 KB
+    of shared memory, so the table displaces nothing. This is the reason
+    it is worth trying a table again after the two attempts
+    optimizations.md records as reverted -- both were measured on a GPU
+    where these kernels were bandwidth-bound with transcendental math to
+    spare, and where the table was paid for out of occupancy."""
+    comptime if TW:
+        comptime n_entries = tw_entries(N)
+        var i = tid
+        while i < n_entries:
+            var angle = -2.0 * PI * Float32(i) / Float32(N)
+            var p = tw_idx(i)
+            t_re[p] = rebind[t_re.ElementType](cos(angle))
+            t_im[p] = rebind[t_im.ElementType](sin(angle))
+            i += nthreads
+        barrier()
+
+
+def twiddle[N: Int, L: Int, TW: Bool, invert: Bool](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    k: Int,
+) -> SIMD[DType.float32, 2]:
+    """The butterfly twiddle `exp(-2*pi*i*k/L)` as `(re, im)`, conjugated
+    when `invert`, for a stage of length `L` inside a length-`N` transform.
+
+    With the table on, `exp(-2*pi*i*k/L) == exp(-2*pi*i*(k*(N//L))/N)`, so
+    the lookup is at logical index `k * (N // L)`. `L` divides `N` and both
+    are powers of two, so that scale is a comptime shift.
+
+    With the table off this evaluates `cos`/`sin` on the angle directly --
+    the same expression, in the same Float32 association, that each of these
+    call sites had inline before the table existed. A `TW=False` build is
+    therefore bit-for-bit the old kernel, so the A/B measures the table and
+    nothing else."""
+    comptime if TW:
+        var p = tw_idx(k * (N // L))
+        var wr = rebind[Scalar[DType.float32]](t_re[p])
+        var wi = rebind[Scalar[DType.float32]](t_im[p])
+        comptime if invert:
+            return SIMD[DType.float32, 2](wr, -wi)
+        else:
+            return SIMD[DType.float32, 2](wr, wi)
+    else:
+        comptime sign: Float32 = 1.0 if invert else -1.0
+        var angle = sign * 2.0 * PI * Float32(k) / Float32(L)
+        return SIMD[DType.float32, 2](cos(angle), sin(angle))
+
+
+def fft_warp_head[N: Int, invert: Bool, TW: Bool](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
     mut a_re: Scalar[DType.float32],
     mut a_im: Scalar[DType.float32],
     mut b_re: Scalar[DType.float32],
@@ -67,9 +195,9 @@ def fft_warp_head[invert: Bool](
         comptime stage_half = 1 << stage
         comptime size = stage_half * 2
         var k = lane & (stage_half - 1)
-        var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
+        var angle_tw = twiddle[N, size, TW, invert](t_re, t_im, k)
+        var wr = angle_tw[0]
+        var wi = angle_tw[1]
         # Branchless role select: `(lane >> stage) & 1` is 0 for the "lo"
         # (i0) role, 1 for "hi" (i1). Computing both candidate results and
         # blending by a 0/1 float mask avoids an `if/else` here, which would
@@ -105,9 +233,9 @@ def fft_warp_head[invert: Bool](
     # stage_half = 32 (size = 64): `a` and `b` are this same thread's own two
     # registers (idx_a's bit 5 is always 0, idx_b's always 1), so this
     # combine is a pure local computation -- no shuffle needed.
-    var angle32 = sign * 2.0 * PI * Float32(lane) / 64.0
-    var wr32 = cos(angle32)
-    var wi32 = sin(angle32)
+    var angle32_tw = twiddle[N, 64, TW, invert](t_re, t_im, lane)
+    var wr32 = angle32_tw[0]
+    var wi32 = angle32_tw[1]
     var tr32 = b_re * wr32 - b_im * wi32
     var ti32 = b_re * wi32 + b_im * wr32
     var new_a_re = a_re + tr32
@@ -120,7 +248,15 @@ def fft_warp_head[invert: Bool](
     b_im = new_b_im
 
 
-def fft_lds_stages[N: Int, first_stage: Int, invert: Bool](
+def fft_lds_stages[N: Int, first_stage: Int, invert: Bool, TW: Bool](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
     s_re: TileTensor[
         DType.float32, type_of(row_major[N]()), MutAnyOrigin,
         address_space = AddressSpace.SHARED,
@@ -174,9 +310,9 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool](
             var a3r = s_re[p3]
             var a3i = s_im[p3]
 
-            var angle_a = sign * 2.0 * PI * Float32(k) / Float32(m)
-            var war = cos(angle_a)
-            var wai = sin(angle_a)
+            var angle_a_tw = twiddle[N, m, TW, invert](t_re, t_im, k)
+            var war = angle_a_tw[0]
+            var wai = angle_a_tw[1]
             var tar = a1r * war - a1i * wai
             var tai = a1r * wai + a1i * war
             var y0r = a0r + tar
@@ -190,9 +326,9 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool](
             var y3r = a2r - tbr
             var y3i = a2i - tbi
 
-            var angle0 = sign * 2.0 * PI * Float32(k) / Float32(span)
-            var w0r = cos(angle0)
-            var w0i = sin(angle0)
+            var angle0_tw = twiddle[N, span, TW, invert](t_re, t_im, k)
+            var w0r = angle0_tw[0]
+            var w0i = angle0_tw[1]
             var t0r = y2r * w0r - y2i * w0i
             var t0i = y2r * w0i + y2i * w0r
             var tcr = y3r * w0r - y3i * w0i
@@ -218,9 +354,9 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool](
         var k = tid % stage_half
         var i0 = group * size + k
         var i1 = i0 + stage_half
-        var angle = sign * 2.0 * PI * Float32(k) / Float32(size)
-        var wr = cos(angle)
-        var wi = sin(angle)
+        var angle_tw = twiddle[N, size, TW, invert](t_re, t_im, k)
+        var wr = angle_tw[0]
+        var wi = angle_tw[1]
         var xr = s_re[i1]
         var xi = s_im[i1]
         var tr = xr * wr - xi * wi
@@ -235,7 +371,7 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool](
 
 
 def fft_row_kernel[
-    N: Int, LT: TensorLayout, invert: Bool
+    N: Int, LT: TensorLayout, invert: Bool, TW: Bool = False
 ](
     re: TileTensor[DType.float32, LT, MutAnyOrigin],
     im: TileTensor[DType.float32, LT, MutAnyOrigin],
@@ -253,6 +389,10 @@ def fft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
 
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 2)
+
     comptime if N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
@@ -265,7 +405,7 @@ def fft_row_kernel[
         var b_re = rebind[Scalar[DType.float32]](re[row, src_b])
         var b_im = rebind[Scalar[DType.float32]](im[row, src_b])
 
-        fft_warp_head[invert](a_re, a_im, b_re, b_im, lane)
+        fft_warp_head[N, invert, TW](t_re, t_im, a_re, a_im, b_re, b_im, lane)
 
         s_re[pos_a] = a_re
         s_im[pos_a] = a_im
@@ -273,7 +413,7 @@ def fft_row_kernel[
         s_im[pos_b] = b_im
         barrier()
 
-        fft_lds_stages[N, 6, invert](s_re, s_im, tid)
+        fft_lds_stages[N, 6, invert, TW](t_re, t_im, s_re, s_im, tid)
     else:
         # Bit-reversed load: thread `tid` fills slots `tid` and `tid + half`.
         var src0 = bit_reverse_ct(tid, log2n)
@@ -284,7 +424,7 @@ def fft_row_kernel[
         s_im[tid + half] = rebind[Scalar[DType.float32]](im[row, src1])
         barrier()
 
-        fft_lds_stages[N, 0, invert](s_re, s_im, tid)
+        fft_lds_stages[N, 0, invert, TW](t_re, t_im, s_re, s_im, tid)
 
     comptime if invert:
         comptime inv_n: Float32 = 1.0 / Float32(N)
@@ -319,7 +459,7 @@ def lds_swizzle(i: Int) -> Int:
 
 
 def fft_row_cmul_ifft_kernel[
-    N: Int, LT: TensorLayout, PLT: TensorLayout
+    N: Int, LT: TensorLayout, PLT: TensorLayout, TW: Bool = False
 ](
     re: TileTensor[DType.float32, LT, MutAnyOrigin],
     im: TileTensor[DType.float32, LT, MutAnyOrigin],
@@ -360,6 +500,10 @@ def fft_row_cmul_ifft_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
 
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 2)
+
     comptime for pass_i in range(2):
         comptime invert = pass_i == 1
 
@@ -393,7 +537,7 @@ def fft_row_cmul_ifft_kernel[
                 b_im = rebind[Scalar[DType.float32]](s_im[sb])
                 barrier()
 
-            fft_warp_head[invert](a_re, a_im, b_re, b_im, lane)
+            fft_warp_head[N, invert, TW](t_re, t_im, a_re, a_im, b_re, b_im, lane)
 
             s_re[pos_a] = a_re
             s_im[pos_a] = a_im
@@ -401,7 +545,7 @@ def fft_row_cmul_ifft_kernel[
             s_im[pos_b] = b_im
             barrier()
 
-            fft_lds_stages[N, 6, invert](s_re, s_im, tid)
+            fft_lds_stages[N, 6, invert, TW](t_re, t_im, s_re, s_im, tid)
         else:
             var src0 = bit_reverse_ct(tid, log2n)
             var src1 = bit_reverse_ct(tid + half, log2n)
@@ -422,7 +566,7 @@ def fft_row_cmul_ifft_kernel[
                 s_im[tid + half] = v1i
             barrier()
 
-            fft_lds_stages[N, 0, invert](s_re, s_im, tid)
+            fft_lds_stages[N, 0, invert, TW](t_re, t_im, s_re, s_im, tid)
 
         comptime if pass_i == 0:
             # The spectrum is in natural order in shared memory; multiply it
@@ -456,6 +600,7 @@ def fft_row_cmul_ifft_kernel[
 def ifft_row_cmul_broadcast_kernel[
     N: Int, D: Int, W2: Int,
     BLT: TensorLayout, ALT: TensorLayout, OLT: TensorLayout,
+    TW: Bool = False,
 ](
     b_re: TileTensor[DType.float32, BLT, MutAnyOrigin],  # (D*W2, N)
     b_im: TileTensor[DType.float32, BLT, MutAnyOrigin],
@@ -514,6 +659,10 @@ def ifft_row_cmul_broadcast_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[N]())
 
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 2)
+
     comptime if N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
@@ -536,7 +685,7 @@ def ifft_row_cmul_broadcast_kernel[
         var b_re_v = yar * ybr - yai * ybi
         var b_im_v = yar * ybi + yai * ybr
 
-        fft_warp_head[True](a_re_v, a_im_v, b_re_v, b_im_v, lane)
+        fft_warp_head[N, True, TW](t_re, t_im, a_re_v, a_im_v, b_re_v, b_im_v, lane)
 
         s_re[pos_a] = a_re_v
         s_im[pos_a] = a_im_v
@@ -544,7 +693,7 @@ def ifft_row_cmul_broadcast_kernel[
         s_im[pos_b] = b_im_v
         barrier()
 
-        fft_lds_stages[N, 6, True](s_re, s_im, tid)
+        fft_lds_stages[N, 6, True, TW](t_re, t_im, s_re, s_im, tid)
     else:
         var src0 = bit_reverse_ct(tid, log2n)
         var src1 = bit_reverse_ct(tid + half, log2n)
@@ -564,7 +713,7 @@ def ifft_row_cmul_broadcast_kernel[
         s_im[tid + half] = yar * ybi + yai * ybr
         barrier()
 
-        fft_lds_stages[N, 0, True](s_re, s_im, tid)
+        fft_lds_stages[N, 0, True, TW](t_re, t_im, s_re, s_im, tid)
 
     comptime inv_n: Float32 = 1.0 / Float32(N)
     dst_re[brow, tid] = rebind[dst_re.ElementType](s_re[tid] * inv_n)
@@ -574,7 +723,7 @@ def ifft_row_cmul_broadcast_kernel[
 
 
 def rfft_row_kernel[
-    N: Int, LT: TensorLayout, OutLT: TensorLayout
+    N: Int, LT: TensorLayout, OutLT: TensorLayout, TW: Bool = False
 ](
     x: TileTensor[DType.float32, LT, MutAnyOrigin],
     out_re: TileTensor[DType.float32, OutLT, MutAnyOrigin],
@@ -597,6 +746,10 @@ def rfft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 4)
+
     comptime if half >= 64 and WARP_SIZE == 32:
         # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
         # for the index-algebra proof), applied to this kernel's internal
@@ -616,9 +769,9 @@ def rfft_row_kernel[
             comptime stage_half = 1 << stage
             comptime size = stage_half * 2
             var k = lane & (stage_half - 1)
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var lo_f = Float32(1 - ((lane >> stage) & 1))
             var hi_f = 1.0 - lo_f
 
@@ -640,9 +793,9 @@ def rfft_row_kernel[
             b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
             b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
 
-        var angle32 = -2.0 * PI * Float32(lane) / 64.0
-        var wr32 = cos(angle32)
-        var wi32 = sin(angle32)
+        var angle32_tw = twiddle[N, 64, TW, False](t_re, t_im, lane)
+        var wr32 = angle32_tw[0]
+        var wi32 = angle32_tw[1]
         var tr32 = b_re * wr32 - b_im * wi32
         var ti32 = b_re * wi32 + b_im * wr32
         var new_a_re = a_re + tr32
@@ -682,9 +835,9 @@ def rfft_row_kernel[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, False](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -698,9 +851,9 @@ def rfft_row_kernel[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, False](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -726,9 +879,9 @@ def rfft_row_kernel[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -775,9 +928,9 @@ def rfft_row_kernel[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, False](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -791,9 +944,9 @@ def rfft_row_kernel[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, False](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -819,9 +972,9 @@ def rfft_row_kernel[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -847,9 +1000,9 @@ def rfft_row_kernel[
         var xe_im = (zi - zi_km) * 0.5
         var xo_re = (zi + zi_km) * 0.5
         var xo_im = -(zr - zr_km) * 0.5
-        var angle = -2.0 * PI * Float32(k) / Float32(N)
-        var wr = cos(angle)
-        var wi = sin(angle)
+        var angle_tw = twiddle[N, N, TW, False](t_re, t_im, k)
+        var wr = angle_tw[0]
+        var wi = angle_tw[1]
         out_re[row, k] = rebind[out_re.ElementType](xe_re + (wr * xo_re - wi * xo_im))
         out_im[row, k] = rebind[out_im.ElementType](xe_im + (wr * xo_im + wi * xo_re))
 
@@ -859,7 +1012,7 @@ def rfft_row_kernel[
 
 
 def rfft_row_kernel_div[
-    N: Int, LT: TensorLayout, OutLT: TensorLayout
+    N: Int, LT: TensorLayout, OutLT: TensorLayout, TW: Bool = False
 ](
     a: TileTensor[DType.float32, LT, MutAnyOrigin],
     b: TileTensor[DType.float32, LT, MutAnyOrigin],
@@ -887,6 +1040,10 @@ def rfft_row_kernel_div[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 4)
+
     comptime if half >= 64 and WARP_SIZE == 32:
         # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
         # for the index-algebra proof), applied to this kernel's internal
@@ -906,9 +1063,9 @@ def rfft_row_kernel_div[
             comptime stage_half = 1 << stage
             comptime size = stage_half * 2
             var k = lane & (stage_half - 1)
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var lo_f = Float32(1 - ((lane >> stage) & 1))
             var hi_f = 1.0 - lo_f
 
@@ -930,9 +1087,9 @@ def rfft_row_kernel_div[
             b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
             b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
 
-        var angle32 = -2.0 * PI * Float32(lane) / 64.0
-        var wr32 = cos(angle32)
-        var wi32 = sin(angle32)
+        var angle32_tw = twiddle[N, 64, TW, False](t_re, t_im, lane)
+        var wr32 = angle32_tw[0]
+        var wi32 = angle32_tw[1]
         var tr32 = b_re * wr32 - b_im * wi32
         var ti32 = b_re * wi32 + b_im * wr32
         var new_a_re = a_re + tr32
@@ -972,9 +1129,9 @@ def rfft_row_kernel_div[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, False](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -988,9 +1145,9 @@ def rfft_row_kernel_div[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, False](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -1016,9 +1173,9 @@ def rfft_row_kernel_div[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -1066,9 +1223,9 @@ def rfft_row_kernel_div[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = -2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, False](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -1082,9 +1239,9 @@ def rfft_row_kernel_div[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = -2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, False](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -1110,9 +1267,9 @@ def rfft_row_kernel_div[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = -2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, False](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -1138,9 +1295,9 @@ def rfft_row_kernel_div[
         var xe_im = (zi - zi_km) * 0.5
         var xo_re = (zi + zi_km) * 0.5
         var xo_im = -(zr - zr_km) * 0.5
-        var angle = -2.0 * PI * Float32(k) / Float32(N)
-        var wr = cos(angle)
-        var wi = sin(angle)
+        var angle_tw = twiddle[N, N, TW, False](t_re, t_im, k)
+        var wr = angle_tw[0]
+        var wi = angle_tw[1]
         out_re[row, k] = rebind[out_re.ElementType](xe_re + (wr * xo_re - wi * xo_im))
         out_im[row, k] = rebind[out_im.ElementType](xe_im + (wr * xo_im + wi * xo_re))
 
@@ -1150,8 +1307,16 @@ def rfft_row_kernel_div[
 
 
 def irfft_row_into_lds[
-    N: Int, InLT: TensorLayout
+    N: Int, TW: Bool, InLT: TensorLayout
 ](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
     in_re: TileTensor[DType.float32, InLT, MutAnyOrigin],
     in_im: TileTensor[DType.float32, InLT, MutAnyOrigin],
     s_re: TileTensor[
@@ -1204,9 +1369,9 @@ def irfft_row_into_lds[
         var aei = (aai + abi) * 0.5
         var adr = (aar - abr) * 0.5
         var adi = (aai - abi) * 0.5
-        var aangle = 2.0 * PI * Float32(ka) / Float32(N)
-        var awr = cos(aangle)
-        var awi = sin(aangle)
+        var aangle_tw = twiddle[N, N, TW, True](t_re, t_im, ka)
+        var awr = aangle_tw[0]
+        var awi = aangle_tw[1]
         var aor = adr * awr - adi * awi
         var aoi = adr * awi + adi * awr
         var a_re = aer - aoi
@@ -1222,9 +1387,9 @@ def irfft_row_into_lds[
         var bei = (bai + bbi) * 0.5
         var bdr = (bar - bbr) * 0.5
         var bdi = (bai - bbi) * 0.5
-        var bangle = 2.0 * PI * Float32(kb) / Float32(N)
-        var bwr = cos(bangle)
-        var bwi = sin(bangle)
+        var bangle_tw = twiddle[N, N, TW, True](t_re, t_im, kb)
+        var bwr = bangle_tw[0]
+        var bwi = bangle_tw[1]
         var bor = bdr * bwr - bdi * bwi
         var boi = bdr * bwi + bdi * bwr
         var b_re = ber - boi
@@ -1234,9 +1399,9 @@ def irfft_row_into_lds[
             comptime stage_half = 1 << stage
             comptime size = stage_half * 2
             var k = lane & (stage_half - 1)
-            var angle = 2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, True](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var lo_f = Float32(1 - ((lane >> stage) & 1))
             var hi_f = 1.0 - lo_f
 
@@ -1258,9 +1423,9 @@ def irfft_row_into_lds[
             b_re = lo_f * (b_re + b_lo_tr) + hi_f * (pb_re - b_hi_tr)
             b_im = lo_f * (b_im + b_lo_ti) + hi_f * (pb_im - b_hi_ti)
 
-        var angle32 = 2.0 * PI * Float32(lane) / 64.0
-        var wr32 = cos(angle32)
-        var wi32 = sin(angle32)
+        var angle32_tw = twiddle[N, 64, TW, True](t_re, t_im, lane)
+        var wr32 = angle32_tw[0]
+        var wi32 = angle32_tw[1]
         var tr32 = b_re * wr32 - b_im * wi32
         var ti32 = b_re * wi32 + b_im * wr32
         var new_a_re = a_re + tr32
@@ -1300,9 +1465,9 @@ def irfft_row_into_lds[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = 2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, True](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -1316,9 +1481,9 @@ def irfft_row_into_lds[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = 2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, True](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -1344,9 +1509,9 @@ def irfft_row_into_lds[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = 2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, True](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -1372,9 +1537,9 @@ def irfft_row_into_lds[
             var ei = (ai + bi) * 0.5
             var dr = (ar - br) * 0.5
             var di = (ai - bi) * 0.5
-            var angle = 2.0 * PI * Float32(k) / Float32(N)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, N, TW, True](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var or_ = dr * wr - di * wi
             var oi_ = dr * wi + di * wr
             var dst = bit_reverse_ct(k, log2h)
@@ -1407,9 +1572,9 @@ def irfft_row_into_lds[
                 var a3r = s_re[p3]
                 var a3i = s_im[p3]
 
-                var angle_a = 2.0 * PI * Float32(k) / Float32(m)
-                var war = cos(angle_a)
-                var wai = sin(angle_a)
+                var angle_a_tw = twiddle[N, m, TW, True](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
                 var tar = a1r * war - a1i * wai
                 var tai = a1r * wai + a1i * war
                 var y0r = a0r + tar
@@ -1423,9 +1588,9 @@ def irfft_row_into_lds[
                 var y3r = a2r - tbr
                 var y3i = a2i - tbi
 
-                var angle0 = 2.0 * PI * Float32(k) / Float32(span)
-                var w0r = cos(angle0)
-                var w0i = sin(angle0)
+                var angle0_tw = twiddle[N, span, TW, True](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
                 var t0r = y2r * w0r - y2i * w0i
                 var t0i = y2r * w0i + y2i * w0r
                 var tcr = y3r * w0r - y3i * w0i
@@ -1451,9 +1616,9 @@ def irfft_row_into_lds[
             var k = tid % stage_half
             var i0 = group * size + k
             var i1 = i0 + stage_half
-            var angle = 2.0 * PI * Float32(k) / Float32(size)
-            var wr = cos(angle)
-            var wi = sin(angle)
+            var angle_tw = twiddle[N, size, TW, True](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
             var xr = s_re[i1]
             var xi = s_im[i1]
             var tr = xr * wr - xi * wi
@@ -1468,7 +1633,7 @@ def irfft_row_into_lds[
 
 
 def irfft_row_kernel[
-    N: Int, InLT: TensorLayout, LT: TensorLayout
+    N: Int, InLT: TensorLayout, LT: TensorLayout, TW: Bool = False
 ](
     in_re: TileTensor[DType.float32, InLT, MutAnyOrigin],
     in_im: TileTensor[DType.float32, InLT, MutAnyOrigin],
@@ -1488,7 +1653,11 @@ def irfft_row_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
-    irfft_row_into_lds[N](in_re, in_im, s_re, s_im, row, tid)
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 4)
+
+    irfft_row_into_lds[N, TW](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
 
     comptime inv_half: Float32 = 1.0 / Float32(half)
     for i in range(2):
@@ -1498,7 +1667,8 @@ def irfft_row_kernel[
 
 
 def irfft_row_mul_kernel[
-    N: Int, SHIFT: Bool, H: Int, InLT: TensorLayout, LT: TensorLayout
+    N: Int, SHIFT: Bool, H: Int, InLT: TensorLayout, LT: TensorLayout,
+    TW: Bool = False,
 ](
     in_re: TileTensor[DType.float32, InLT, MutAnyOrigin],
     in_im: TileTensor[DType.float32, InLT, MutAnyOrigin],
@@ -1536,7 +1706,11 @@ def irfft_row_mul_kernel[
     var s_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
     var s_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[half]())
 
-    irfft_row_into_lds[N](in_re, in_im, s_re, s_im, row, tid)
+    var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
+    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 4)
+
+    irfft_row_into_lds[N, TW](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
 
     var out_row: Int
     comptime if SHIFT:
@@ -2097,7 +2271,7 @@ def irfft2_batched_gpu_cmul_broadcast[
 
 
 def rfft_w_div_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -2116,7 +2290,7 @@ def rfft_w_div_transposed_gpu[
     comptime W2 = W // 2 + 1
     comptime in_row_layout = row_major[D * H, W]()
     comptime out_row_layout = row_major[D * H, W2]()
-    comptime kernel_w = rfft_row_kernel_div[W, type_of(in_row_layout), type_of(out_row_layout)]
+    comptime kernel_w = rfft_row_kernel_div[W, type_of(in_row_layout), type_of(out_row_layout), TW]
     ctx.enqueue_function[kernel_w](
         TileTensor(a_buf, in_row_layout), TileTensor(b_buf, in_row_layout),
         TileTensor(t_re, out_row_layout), TileTensor(t_im, out_row_layout),
@@ -2135,7 +2309,7 @@ def rfft_w_div_transposed_gpu[
 
 
 def rfft2_batched_gpu_div_t[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -2151,10 +2325,10 @@ def rfft2_batched_gpu_div_t[
     consumer, `irfft2_batched_gpu_cmul_broadcast_t`, wants the transposed
     layout, so the final transpose is pure waste."""
     comptime W2 = W // 2 + 1
-    rfft_w_div_transposed_gpu[D, H, W, TILE](ctx, a_buf, b_buf, out_re, out_im, t_re, t_im)
+    rfft_w_div_transposed_gpu[D, H, W, TILE, TW](ctx, a_buf, b_buf, out_re, out_im, t_re, t_im)
 
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=H // 2,
@@ -2162,7 +2336,7 @@ def rfft2_batched_gpu_div_t[
 
 
 def irfft2_batched_gpu_cmul_broadcast_mul_t[
-    D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool
+    D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut a_re: DeviceBuffer[DType.float32],  # (W/2+1, H), broadcast over depth
@@ -2203,7 +2377,7 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     comptime a_row_layout = row_major[W2, H]()
     comptime b_row_layout = row_major[D * W2, H]()
     comptime kernel_h = ifft_row_cmul_broadcast_kernel[
-        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout)
+        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW
     ]
     ctx.enqueue_function[kernel_h](
         TileTensor(b_re, b_row_layout), TileTensor(b_im, b_row_layout),
@@ -2225,7 +2399,7 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     comptime in_row_layout = row_major[D * H, W2]()
     comptime out_row_layout = row_major[D * H, W]()
     comptime kernel_w = irfft_row_mul_kernel[
-        W, SHIFT, H, type_of(in_row_layout), type_of(out_row_layout)
+        W, SHIFT, H, type_of(in_row_layout), type_of(out_row_layout), TW
     ]
     ctx.enqueue_function[kernel_w](
         TileTensor(scratch_re, in_row_layout), TileTensor(scratch_im, in_row_layout),
@@ -2235,7 +2409,7 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
 
 
 def rfft_w_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2254,7 +2428,7 @@ def rfft_w_transposed_gpu[
     var x_rows = TileTensor(x_buf, in_row_layout)
     var re_rows = TileTensor(t_re, out_row_layout)
     var im_rows = TileTensor(t_im, out_row_layout)
-    comptime kernel_w = rfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout)]
+    comptime kernel_w = rfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW]
     ctx.enqueue_function[kernel_w](x_rows, re_rows, im_rows, grid_dim=D * H, block_dim=W // 4)
 
     comptime in_layout_a = row_major[D, H, W2]()
@@ -2269,7 +2443,7 @@ def rfft_w_transposed_gpu[
 
 
 def irfft_w_from_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2294,7 +2468,7 @@ def irfft_w_from_transposed_gpu[
 
     comptime in_row_layout = row_major[D * H, W2]()
     comptime out_row_layout = row_major[D * H, W]()
-    comptime kernel_w = irfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout)]
+    comptime kernel_w = irfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW]
     ctx.enqueue_function[kernel_w](
         TileTensor(t_re, in_row_layout), TileTensor(t_im, in_row_layout),
         TileTensor(out_x, out_row_layout),
@@ -2303,7 +2477,7 @@ def irfft_w_from_transposed_gpu[
 
 
 def fft_col_cmul_ifft_gpu[
-    D: Int, H: Int, W: Int
+    D: Int, H: Int, W: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut re: DeviceBuffer[DType.float32],
@@ -2321,7 +2495,7 @@ def fft_col_cmul_ifft_gpu[
     of each other. See optimizations.md sec. 3(a)."""
     comptime W2 = W // 2 + 1
     comptime row_layout = row_major[D * W2, H]()
-    comptime kernel = fft_row_cmul_ifft_kernel[H, type_of(row_layout), type_of(row_layout)]
+    comptime kernel = fft_row_cmul_ifft_kernel[H, type_of(row_layout), type_of(row_layout), TW]
     ctx.enqueue_function[kernel](
         TileTensor(re, row_layout), TileTensor(im, row_layout),
         TileTensor(p_re, row_layout), TileTensor(p_im, row_layout),
@@ -2330,7 +2504,7 @@ def fft_col_cmul_ifft_gpu[
 
 
 def rfft2_batched_gpu_t[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2346,10 +2520,10 @@ def rfft2_batched_gpu_t[
     round-trip transpose pair that used to sit across every
     `rfft2 -> elementwise -> irfft2` boundary."""
     comptime W2 = W // 2 + 1
-    rfft_w_transposed_gpu[D, H, W, TILE](ctx, x_buf, out_re, out_im, t_re, t_im)
+    rfft_w_transposed_gpu[D, H, W, TILE, TW](ctx, x_buf, out_re, out_im, t_re, t_im)
 
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=H // 2,
@@ -2357,7 +2531,7 @@ def rfft2_batched_gpu_t[
 
 
 def irfft2_batched_gpu_t[
-    D: Int, H: Int, W: Int, TILE: Int
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2371,10 +2545,10 @@ def irfft2_batched_gpu_t[
     and left in an undefined state."""
     comptime W2 = W // 2 + 1
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW]
     ctx.enqueue_function[kernel_h](
         TileTensor(in_re, row_layout_h), TileTensor(in_im, row_layout_h),
         grid_dim=D * W2, block_dim=H // 2,
     )
 
-    irfft_w_from_transposed_gpu[D, H, W, TILE](ctx, in_re, in_im, out_x, t_re, t_im)
+    irfft_w_from_transposed_gpu[D, H, W, TILE, TW](ctx, in_re, in_im, out_x, t_re, t_im)
