@@ -15,7 +15,7 @@ from std.time import perf_counter_ns
 from layout import TileTensor, row_major
 from max.gpu.host import DeviceContext, DeviceBuffer
 
-from fft_gpu import rfft2_batched_gpu
+from fft_gpu import rfft2_batched_gpu_t
 from openflr_cpu import flip_hw, shift_hw
 from openflr_gpu import run_v1_step_gpu, run_v2_step_gpu, OpenFlrScratch
 
@@ -86,9 +86,11 @@ def prepare_psf(ctx: DeviceContext, psf_raw: List[Float32]) raises -> Tuple[
     DeviceBuffer[DType.float32], DeviceBuffer[DType.float32],
     DeviceBuffer[DType.float32], DeviceBuffer[DType.float32],
 ]:
-    """Normalizes the PSF and returns the `rfft2_batched_gpu` half spectrum
-    (shape (D, H, W/2+1)) of each: (psf_fft_re, psf_fft_im, psft_fft_v1_re,
-    psft_fft_v1_im, psft_fft_v2_re, psft_fft_v2_im)."""
+    """Normalizes the PSF and returns the rfft2 half spectrum of each:
+    (psf_fft_re, psf_fft_im, psft_fft_v1_re, psft_fft_v1_im, psft_fft_v2_re,
+    psft_fft_v2_im). All three are in the transposed canonical layout
+    (D, W/2+1, H) that both the forward and the back-projection chains
+    consume directly."""
     var total = global_sum(psf_raw, N)
     var psf: List[Float32] = []
     for i in range(N):
@@ -102,17 +104,17 @@ def prepare_psf(ctx: DeviceContext, psf_raw: List[Float32]) raises -> Tuple[
     var psf_fft_im = ctx.enqueue_create_buffer[DType.float32](N2)
     var t_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var t_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psf_buf, psf_fft_re, psf_fft_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psf_buf, psf_fft_re, psf_fft_im, t_re, t_im)
 
     var psft_v1_buf = upload[N](ctx, psf_flipped^)
     var psft_v1_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var psft_v1_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psft_v1_buf, psft_v1_re, psft_v1_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psft_v1_buf, psft_v1_re, psft_v1_im, t_re, t_im)
 
     var psft_v2_buf = upload[N](ctx, psf_flipped_shifted^)
     var psft_v2_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var psft_v2_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psft_v2_buf, psft_v2_re, psft_v2_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psft_v2_buf, psft_v2_re, psft_v2_im, t_re, t_im)
 
     return psf_fft_re^, psf_fft_im^, psft_v1_re^, psft_v1_im^, psft_v2_re^, psft_v2_im^
 

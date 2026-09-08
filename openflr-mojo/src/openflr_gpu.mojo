@@ -3,16 +3,18 @@ built on top of the radix-2 FFT kernels in `fft_gpu`.
 """
 
 from std.math import ceildiv
-from std.gpu import global_idx, thread_idx, block_idx
+from std.gpu import global_idx
 from layout import TileTensor, TensorLayout, row_major
 from max.gpu.host import DeviceContext, DeviceBuffer
 
 from fft_gpu import (
-    rfft2_batched_gpu,
-    rfft2_batched_gpu_div,
-    irfft2_batched_gpu,
-    irfft2_batched_gpu_cmul,
-    irfft2_batched_gpu_cmul_broadcast,
+    rfft2_batched_gpu_t,
+    rfft2_batched_gpu_div_t,
+    irfft2_batched_gpu_t,
+    irfft2_batched_gpu_cmul_broadcast_mul_t,
+    rfft_w_transposed_gpu,
+    irfft_w_from_transposed_gpu,
+    fft_col_cmul_ifft_gpu,
 )
 
 comptime BLOCK_1D = 256
@@ -36,7 +38,6 @@ struct OpenFlrScratch[D: Int, H: Int, W: Int](Movable):
     var err_fft_im: DeviceBuffer[DType.float32]
     var prod2_re: DeviceBuffer[DType.float32]
     var prod2_im: DeviceBuffer[DType.float32]
-    var back: DeviceBuffer[DType.float32]
     var t_re_dhw2: DeviceBuffer[DType.float32]
     var t_im_dhw2: DeviceBuffer[DType.float32]
     var t_re_hw2: DeviceBuffer[DType.float32]
@@ -60,7 +61,6 @@ struct OpenFlrScratch[D: Int, H: Int, W: Int](Movable):
         self.err_fft_im = ctx.enqueue_create_buffer[DType.float32](HW2)
         self.prod2_re = ctx.enqueue_create_buffer[DType.float32](DHW2)
         self.prod2_im = ctx.enqueue_create_buffer[DType.float32](DHW2)
-        self.back = ctx.enqueue_create_buffer[DType.float32](DHW)
         self.t_re_dhw2 = ctx.enqueue_create_buffer[DType.float32](DHW2)
         self.t_im_dhw2 = ctx.enqueue_create_buffer[DType.float32](DHW2)
         self.t_re_hw2 = ctx.enqueue_create_buffer[DType.float32](HW2)
@@ -134,22 +134,6 @@ def sum_over_depth_real_kernel[
         out_t[i] = rebind[out_t.ElementType](acc)
 
 
-def elementwise_mul_kernel[
-    LT: TensorLayout
-](
-    a: TileTensor[DType.float32, LT, MutAnyOrigin],
-    b: TileTensor[DType.float32, LT, MutAnyOrigin],
-    out_t: TileTensor[DType.float32, LT, MutAnyOrigin],
-    n: Int32,
-):
-    comptime assert a.flat_rank == 1, "expected flat tensor"
-    var i = global_idx.x
-    if i < Int(n):
-        out_t[i] = rebind[out_t.ElementType](
-            rebind[Scalar[DType.float32]](a[i]) * rebind[Scalar[DType.float32]](b[i])
-        )
-
-
 def run_v1_step_gpu[
     D: Int, H: Int, W: Int, TILE: Int
 ](
@@ -161,9 +145,12 @@ def run_v1_step_gpu[
     mut out_buf: DeviceBuffer[DType.float32],
     mut scratch: OpenFlrScratch[D, H, W],
 ) raises:
-    """Real-input-optimized (rfft2/irfft2) OpenFLR v1 step -- `psf_fft_*`/
-    `psft_fft_*` are the `rfft2_batched_gpu` half spectrum of the (real)
-    PSF, shape (D, H, W/2+1)."""
+    """Real-input-optimized (rfft2/irfft2) OpenFLR v1 step.
+
+    `psf_fft_*` and `psft_fft_*` are both `rfft2_batched_gpu_t` half spectra
+    of the (real) PSF in the transposed canonical layout, shape
+    (D, W/2+1, H) -- see optimizations.md sec. 3(a) for the forward chain and
+    sec. 3(b) for the back-projection chain."""
     comptime W2 = W // 2 + 1
     comptime HW = H * W
     comptime HW2 = H * W2
@@ -174,16 +161,28 @@ def run_v1_step_gpu[
     comptime layout_hw2 = row_major[HW2]()
     comptime layout_dhw2 = row_major[DHW2]()
 
-    rfft2_batched_gpu[D, H, W, TILE](ctx, data_buf, scratch.data_fft_re, scratch.data_fft_im, scratch.t_re_dhw2, scratch.t_im_dhw2)
-
-    # Fused: irfft2(psf_fft * data_fft) computed directly by
-    # irfft2_batched_gpu_cmul, never materializing the (D, H, W/2+1) complex
-    # product -- the single biggest buffer in the pipeline. `scratch.prod_re`/
-    # `scratch.prod_im` are reused as the fused function's internal scratch
-    # (they no longer hold the product itself).
-    irfft2_batched_gpu_cmul[D, H, W, TILE](
-        ctx, psf_fft_re, psf_fft_im, scratch.data_fft_re, scratch.data_fft_im,
-        scratch.conv, scratch.prod_re, scratch.prod_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
+    # conv = irfft2(psf_fft * rfft2(data)), with the frequency-domain
+    # buffers kept in the transposed (D, W/2+1, H) canonical layout. The old
+    # `rfft2 -> irfft2_cmul` pair ran a transpose immediately followed by its
+    # own inverse across that boundary (the elementwise multiply between them
+    # commutes with the transpose, so both were redundant), and then ran the
+    # forward and inverse height-axis FFTs as two separate kernels with a
+    # full global round trip between them. Keeping the spectrum transposed
+    # deletes both transposes; `fft_col_cmul_ifft_gpu` then does forward FFT,
+    # multiply and inverse FFT in one shared-memory residency. Eight
+    # dispatches become three, moving 2/3 of the bytes. `psf_fft_*` is
+    # precomputed in the same transposed layout (free -- PSF prep is outside
+    # the timed loop). See optimizations.md sec. 3(a).
+    rfft_w_transposed_gpu[D, H, W, TILE](
+        ctx, data_buf, scratch.t_re_dhw2, scratch.t_im_dhw2,
+        scratch.data_fft_re, scratch.data_fft_im,
+    )
+    fft_col_cmul_ifft_gpu[D, H, W](
+        ctx, scratch.t_re_dhw2, scratch.t_im_dhw2, psf_fft_re, psf_fft_im,
+    )
+    irfft_w_from_transposed_gpu[D, H, W, TILE](
+        ctx, scratch.t_re_dhw2, scratch.t_im_dhw2, scratch.conv,
+        scratch.data_fft_re, scratch.data_fft_im,
     )
 
     comptime sumk = sum_over_depth_real_kernel[type_of(layout_dhw), type_of(layout_hw)]
@@ -193,29 +192,27 @@ def run_v1_step_gpu[
     )
 
     # Fused: rfft2(image_buf / denom) computed directly by
-    # rfft2_batched_gpu_div, dividing at the row-FFT's load stage instead of
-    # materializing image_buf / denom into a separate img_err buffer first.
-    rfft2_batched_gpu_div[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
+    # rfft2_batched_gpu_div_t, dividing at the row-FFT's load stage instead
+    # of materializing image_buf / denom into a separate img_err buffer
+    # first, and leaving the result in the transposed (1, W/2+1, H) layout
+    # its consumer below wants.
+    rfft2_batched_gpu_div_t[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
 
-    # Fused: irfft2(err_fft * psft_fft) computed directly by
-    # irfft2_batched_gpu_cmul_broadcast, never materializing the broadcast
-    # complex product. `scratch.prod2_re`/`scratch.prod2_im` are reused as
-    # the fused function's internal scratch.
-    irfft2_batched_gpu_cmul_broadcast[D, H, W, TILE](
+    # Fused: the whole tail of the update -- `data * fftshift(irfft2(err_fft
+    # * psft_fft))` -- computed by irfft2_batched_gpu_cmul_broadcast_mul_t in
+    # three kernels. The broadcast complex product is never materialized, and
+    # with both operands in the transposed (D, W/2+1, H) layout the transpose
+    # that used to carry that multiply is gone too; it now happens at the
+    # inverse column FFT's load (optimizations.md sec. 3(b)). The closing
+    # fftshift-and-multiply against `data_buf` is likewise folded into the
+    # width inverse FFT's store, which already holds the finished row in
+    # shared memory, so the (D, H, W) backprojection buffer is never written
+    # or read back (sec. 3(c)) -- SHIFT=True rotates the destination index.
+    # `scratch.prod2_re`/`scratch.prod2_im` are reused as the fused
+    # function's internal scratch.
+    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, True](
         ctx, scratch.err_fft_re, scratch.err_fft_im, psft_fft_re, psft_fft_im,
-        scratch.back, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
-    )
-
-    # v1 applies an fftshift over (-2, -1) to the backprojection before the
-    # final multiply; fused into a single kernel that reads `back` at the
-    # shift-computed index and multiplies against `data_buf` directly,
-    # eliminating the separate `shifted` scratch buffer and kernel launch.
-    comptime layout_dhw3 = row_major[D, H, W]()
-    comptime smk = shift_mul_kernel[H, W, type_of(layout_dhw3)]
-    ctx.enqueue_function[smk](
-        TileTensor(data_buf, layout_dhw3), TileTensor(scratch.back, layout_dhw3),
-        TileTensor(out_buf, layout_dhw3),
-        grid_dim=(ceildiv(W, 16), ceildiv(H, 16), D), block_dim=(16, 16),
+        data_buf, out_buf, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
     )
 
 
@@ -230,20 +227,27 @@ def run_v2_step_gpu[
     mut out_buf: DeviceBuffer[DType.float32],
     mut scratch: OpenFlrScratch[D, H, W],
 ) raises:
-    """Real-input-optimized (rfft2/irfft2) OpenFLR v2 step -- `psf_fft_*`/
-    `psft_fft_*` are the `rfft2_batched_gpu` half spectrum of the (real)
-    PSF, shape (D, H, W/2+1)."""
+    """Real-input-optimized (rfft2/irfft2) OpenFLR v2 step.
+
+    `psf_fft_*` and `psft_fft_*` are both `rfft2_batched_gpu_t` half spectra
+    of the (real) PSF in the transposed canonical layout, shape
+    (D, W/2+1, H) -- see optimizations.md sec. 3(a) for the forward chain and
+    sec. 3(b) for the back-projection chain."""
     comptime W2 = W // 2 + 1
     comptime HW = H * W
     comptime HW2 = H * W2
-    comptime DHW = D * HW
     comptime DHW2 = D * HW2
-    comptime layout_dhw = row_major[DHW]()
-    comptime layout_hw = row_major[HW]()
     comptime layout_hw2 = row_major[HW2]()
     comptime layout_dhw2 = row_major[DHW2]()
 
-    rfft2_batched_gpu[D, H, W, TILE](ctx, data_buf, scratch.data_fft_re, scratch.data_fft_im, scratch.t_re_dhw2, scratch.t_im_dhw2)
+    # Transposed (D, W/2+1, H) canonical spectrum, as in v1: the final
+    # transpose of `rfft2` and the leading transpose of the `irfft2` below
+    # were exact inverses of each other, and everything in between
+    # (`complex_mul_kernel`, `sum_over_depth_kernel`) is elementwise or a
+    # depth reduction, both of which commute with a transpose of the last two
+    # axes. `psf_fft_*` is precomputed transposed to match. See
+    # optimizations.md sec. 3(a).
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, data_buf, scratch.data_fft_re, scratch.data_fft_im, scratch.t_re_dhw2, scratch.t_im_dhw2)
 
     comptime cmul = complex_mul_kernel[type_of(layout_dhw2)]
     ctx.enqueue_function[cmul](
@@ -260,55 +264,22 @@ def run_v2_step_gpu[
         Int32(D), Int32(HW2), grid_dim=ceildiv(HW2, BLOCK_1D), block_dim=BLOCK_1D,
     )
 
-    irfft2_batched_gpu[1, H, W, TILE](ctx, scratch.reduce_re, scratch.reduce_im, scratch.denom, scratch.t_re_hw2, scratch.t_im_hw2)
+    irfft2_batched_gpu_t[1, H, W, TILE](ctx, scratch.reduce_re, scratch.reduce_im, scratch.denom, scratch.t_re_hw2, scratch.t_im_hw2)
 
     # Fused: rfft2(image_buf / denom) computed directly by
-    # rfft2_batched_gpu_div, dividing at the row-FFT's load stage instead of
-    # materializing image_buf / denom into a separate img_err buffer first.
-    rfft2_batched_gpu_div[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
+    # rfft2_batched_gpu_div_t, dividing at the row-FFT's load stage instead
+    # of materializing image_buf / denom into a separate img_err buffer
+    # first, and leaving the result in the transposed (1, W/2+1, H) layout
+    # its consumer below wants.
+    rfft2_batched_gpu_div_t[1, H, W, TILE](ctx, image_buf, scratch.denom, scratch.err_fft_re, scratch.err_fft_im, scratch.t_re_hw2, scratch.t_im_hw2)
 
-    # Fused: irfft2(err_fft * psft_fft) computed directly by
-    # irfft2_batched_gpu_cmul_broadcast, never materializing the broadcast
-    # complex product. `scratch.prod2_re`/`scratch.prod2_im` are reused as
-    # the fused function's internal scratch.
-    irfft2_batched_gpu_cmul_broadcast[D, H, W, TILE](
+    # Fused: the whole tail of the update -- `data * irfft2(err_fft *
+    # psft_fft)` -- computed by irfft2_batched_gpu_cmul_broadcast_mul_t in
+    # three kernels; see the same call in `run_v1_step_gpu` for what each
+    # fusion removes. v2 applies no fftshift, hence SHIFT=False.
+    # `scratch.prod2_re`/`scratch.prod2_im` are reused as the fused
+    # function's internal scratch.
+    irfft2_batched_gpu_cmul_broadcast_mul_t[D, H, W, TILE, False](
         ctx, scratch.err_fft_re, scratch.err_fft_im, psft_fft_re, psft_fft_im,
-        scratch.back, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
+        data_buf, out_buf, scratch.prod2_re, scratch.prod2_im, scratch.t_re_dhw2, scratch.t_im_dhw2,
     )
-
-    comptime mulk = elementwise_mul_kernel[type_of(layout_dhw)]
-    ctx.enqueue_function[mulk](
-        TileTensor(data_buf, layout_dhw), TileTensor(scratch.back, layout_dhw),
-        TileTensor(out_buf, layout_dhw),
-        Int32(DHW), grid_dim=ceildiv(DHW, BLOCK_1D), block_dim=BLOCK_1D,
-    )
-
-
-def shift_mul_kernel[
-    H: Int, W: Int, LT: TensorLayout
-](
-    data: TileTensor[DType.float32, LT, MutAnyOrigin],  # (D, H, W)
-    back: TileTensor[DType.float32, LT, MutAnyOrigin],  # (D, H, W), unshifted
-    out_t: TileTensor[DType.float32, LT, MutAnyOrigin],  # (D, H, W)
-):
-    """Fusion of an fftshift over the last two axes with the following
-    elementwise multiply: computes `out = data * fftshift(back)` directly,
-    reading `back` at the shift-computed index and multiplying against
-    `data` in the same kernel, instead of materializing the shifted buffer
-    through a separate kernel launch and a full round trip through global
-    memory. Valid because fftshift is its own inverse for even H, W:
-    fftshift(back)[r, c] = back[(r+H/2)%H, (c+W/2)%W]."""
-    comptime assert data.flat_rank == 3, "expected (D, H, W) tensor"
-    comptime hh = H // 2
-    comptime hw2 = W // 2
-    var b = block_idx.z
-    var row = block_idx.y * 16 + thread_idx.y
-    var col = block_idx.x * 16 + thread_idx.x
-    if row < H and col < W:
-        var src_row = (row + hh) % H
-        var src_col = (col + hw2) % W
-        var shifted_val = rebind[Scalar[DType.float32]](back[b, src_row, src_col])
-        var data_val = rebind[Scalar[DType.float32]](data[b, row, col])
-        out_t[b, row, col] = rebind[out_t.ElementType](data_val * shifted_val)
-
-

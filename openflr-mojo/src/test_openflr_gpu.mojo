@@ -3,7 +3,7 @@ from std.sys import has_accelerator
 from layout import TileTensor, row_major
 from max.gpu.host import DeviceContext, DeviceBuffer
 
-from fft_gpu import rfft2_batched_gpu
+from fft_gpu import rfft2_batched_gpu_t
 from openflr_cpu import flip_hw, shift_hw
 from openflr_gpu import run_v1_step_gpu, run_v2_step_gpu, OpenFlrScratch
 from test_openflr_data import test_data_openflr
@@ -69,17 +69,17 @@ def main() raises:
     var psf_fft_im = ctx.enqueue_create_buffer[DType.float32](N2)
     var t_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var t_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psf_buf, psf_fft_re, psf_fft_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psf_buf, psf_fft_re, psf_fft_im, t_re, t_im)
 
     var psft_v1_buf = upload[N](ctx, psf_flipped.copy())
     var psft_fft_v1_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var psft_fft_v1_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psft_v1_buf, psft_fft_v1_re, psft_fft_v1_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psft_v1_buf, psft_fft_v1_re, psft_fft_v1_im, t_re, t_im)
 
     var psft_v2_buf = upload[N](ctx, psf_flipped_shifted.copy())
     var psft_fft_v2_re = ctx.enqueue_create_buffer[DType.float32](N2)
     var psft_fft_v2_im = ctx.enqueue_create_buffer[DType.float32](N2)
-    rfft2_batched_gpu[D, H, W, TILE](ctx, psft_v2_buf, psft_fft_v2_re, psft_fft_v2_im, t_re, t_im)
+    rfft2_batched_gpu_t[D, H, W, TILE](ctx, psft_v2_buf, psft_fft_v2_re, psft_fft_v2_im, t_re, t_im)
 
     var data_buf_v1 = upload[N](ctx, data.copy())
     var image_buf = upload[HW](ctx, image.copy())

@@ -570,3 +570,1232 @@ but whether it's worth the added code surface depends on whether H100's
 better barrier/shared-memory throughput (relative to its much higher
 compute throughput) makes stage-count/barrier-count matter more or less
 there than it does on this bandwidth-constrained iGPU.
+
+---
+
+# Session: rocFFT-guided investigation
+
+Brief: compare against the ROCm rocFFT implementation (`../rocfft` ->
+`rocm-libraries/projects/rocfft`) to find optimization opportunities. No
+code was changed this session. Hardware: same AMD gfx1151 (Radeon 8060S /
+Ryzen AI MAX+ PRO 395, 40 CU, wave32, LPDDR5X unified memory).
+
+Two things changed the picture materially versus every prior session:
+
+1. **`rocprofv3` works on this GPU.** Prior sessions concluded profiling
+   was impossible here (`rocprof`/`rocprofv2`/`rocprof-compute` all abort
+   during HSA agent enumeration). ROCm 7.2 ships `rocprofv3`, which
+   attaches cleanly to the Mojo binary and costs ~1% runtime overhead. We
+   now have real per-kernel dispatch data instead of host-side
+   isolate-and-time inference.
+2. **A measured achievable-bandwidth number for this GPU: ~232 GB/s.**
+   Everything below is interpreted against that ceiling.
+
+## 0. Headline: we are not actually behind PyTorch/JAX per unit of bandwidth
+
+This reframes the whole task, so it goes first.
+
+Measured achievable bandwidth on this GPU (HIP `float4` streaming
+kernels, 1 GiB buffers, 20 iterations):
+
+| test | GB/s |
+|---|---|
+| copy (read+write) | 232.5 |
+| read-only | 237.9 |
+
+(Theoretical peak for Strix Halo's 256-bit LPDDR5X-8000 is 256 GB/s, so
+232 GB/s is ~91% of theoretical — a normal streaming ceiling.)
+
+A byte-traffic model of the pipeline — every kernel's global reads plus
+writes at D=41, H=W=2048, W2=1025, per the per-kernel `MB` column in
+§2 — gives **20.15 GB per v1 iteration** and **16.12 GB per v2
+iteration**.
+Dividing the published times in `../results.md` by that same traffic
+model, against each GPU's theoretical peak bandwidth:
+
+| GPU (peak BW) | v1 backend/time | v1 % of peak | v2 backend/time | v2 % of peak |
+|---|---|---|---|---|
+| H100 SXM (3350 GB/s) | torch 0.0118 s | 51% | torch 0.00668 s | 72% |
+| H100 SXM (3350 GB/s) | jax 0.00973 s | 62% | jax 0.00631 s | 76% |
+| A100 SXM (2039 GB/s) | jax 0.0172 s | 57% | jax 0.0112 s | 71% |
+| L40S (864 GB/s) | jax 0.0402 s | 58% | jax 0.0252 s | 74% |
+| V100 PCIe (900 GB/s) | jax 0.0357 s | 63% | jax 0.0236 s | 76% |
+| **gfx1151 (256 GB/s)** | **mojo 0.1197 s** | **66%** | **mojo 0.0900 s** | **70%** |
+
+Every backend on every GPU lands in a 51-76% band, and the Mojo
+implementation is at the **top** of the band for v1 and inside it for v2.
+Against the *achievable* 232 GB/s rather than theoretical, Mojo is at 72%
+(v1) and 77% (v2).
+
+The interpretation: **this pipeline is memory-bandwidth-bound on every
+GPU tested, all implementations run at a similar fraction of their
+hardware's bandwidth, and the 10-14x absolute gap to H100 is almost
+entirely the 13x bandwidth gap between LPDDR5X-8000 and HBM3.** The Mojo
+kernels are not the problem.
+
+Caveat: this assumes cuFFT/XLA move a similar number of bytes to our
+model. That is an assumption, not a measurement — but the consistency of
+the 51-76% band across four GPUs spanning a 3.9x bandwidth range is
+strong evidence that all of them are bandwidth-bound with comparable
+efficiency. **Worth confirming directly** by running `main.py` with a
+ROCm build of torch on this machine (see §6) — the currently-installed
+`.venv` torch is a CUDA build (`2.13.0+cu126`, `torch.version.hip is
+None`), so there is no same-hardware reference today.
+
+Consequence for prioritization: micro-optimizing kernels can win at most
+~1.3x (72% -> 100% of achievable). **Moving fewer bytes is the only lever
+with a big payoff**, and §3 shows there are ~33% of bytes available to
+remove.
+
+## 1. Profiling is unblocked: use `rocprofv3`
+
+```
+pixi run -- /opt/rocm/bin/rocprofv3 --kernel-trace --stats \
+    -d <outdir> -o v1 --output-format csv \
+    -- mojo run src/main.mojo -- v1 3
+```
+
+Produces `<outdir>/v1_kernel_trace.csv` (per-dispatch start/end
+timestamps, grid/block dims, LDS bytes, VGPR/SGPR counts) and
+`v1_kernel_stats.csv` (per-kernel aggregates). Overhead measured at ~1%
+(v1 0.1216 s under the profiler vs 0.1197 s without), so the numbers are
+trustworthy. `--stats` alone is enough for a breakdown; `rocprofv3-avail`
+lists hardware counters if per-kernel DRAM/L2 counters are wanted next.
+
+This retires the standing "needs real profiling tools on the target
+hardware" caveat in the earlier sections — at least for kernel-level
+timing on *this* GPU. It also means every prior host-side
+`perf_counter_ns` isolation result in this log can now be re-checked
+cheaply.
+
+## 2. Measured per-kernel breakdown (one steady-state iteration)
+
+Achieved GB/s = (modelled bytes) / (measured duration). Compare against
+the 232 GB/s ceiling.
+
+### v1 — 121.6 ms total (matches the 0.1197 s benchmark)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6226 | 1376 | **221** |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8511 | 1377 | 162 |
+| 3 | `fft_row_kernel` (H, fwd) | 7079 | 1377 | **195** |
+| 4 | `transpose_kernel` (W2,H)->(H,W2) | 9598 | 1377 | 143 |
+| 5 | `transpose_kernel_cmul` | 14865 | 2066 | 139 |
+| 6 | `fft_row_kernel` (H, inv) | 6832 | 1377 | **202** |
+| 7 | `transpose_kernel` | 9291 | 1377 | 148 |
+| 8 | `irfft_row_kernel` (W) | 6159 | 1376 | **223** |
+| 9 | `sum_over_depth_real_kernel` | 3294 | 705 | **214** |
+| 10 | `rfft2_batched_gpu_div` (4 kernels, (1,H,W)) | 499 | 151 | — |
+| 11 | `transpose_kernel_cmul_broadcast` | 16304 | 1394* | **85*** |
+| 12 | `fft_row_kernel` (H, inv) | 6850 | 1377 | 201 |
+| 13 | `transpose_kernel` | 9494 | 1377 | 145 |
+| 14 | `irfft_row_kernel` (W) | 6151 | 1376 | **224** |
+| 15 | `shift_mul_kernel` | 10411 | 2064 | **198** |
+| | **total** | **121564** | 20147 | 166 |
+
+### v2 — 90.1 ms total (matches the 0.0900 s benchmark)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6272 | 1376 | **219** |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8413 | 1377 | 164 |
+| 3 | `fft_row_kernel` (H, fwd) | 7168 | 1377 | **192** |
+| 4 | `transpose_kernel` (W2,H)->(H,W2) | 9434 | 1377 | 146 |
+| 5 | `complex_mul_kernel` | 9606 | 2066 | **215** |
+| 6 | `sum_over_depth_kernel` | 3200 | 705 | **220** |
+| 7 | `irfft2_batched_gpu` (4 kernels, (1,H,W)) | 440 | 101 | — |
+| 8 | `rfft2_batched_gpu_div` (4 kernels) | 588 | 151 | — |
+| 9 | `transpose_kernel_cmul_broadcast` | 13555 | 1394* | **103*** |
+| 10 | `fft_row_kernel` (H, inv) | 6807 | 1377 | **202** |
+| 11 | `transpose_kernel` | 9444 | 1377 | 146 |
+| 12 | `irfft_row_kernel` (W) | 6155 | 1376 | **224** |
+| 13 | `elementwise_mul_kernel` | 9009 | 2064 | **229** |
+| | **total** | **90091** | 16118 | 179 |
+
+\* The `_cmul_broadcast` MB figure counts the broadcast `(H, W2)` complex
+operand once (16.8 MB), assuming it stays cache-resident across the 41
+depth slices. Its apparent GB/s is well below every other kernel's,
+which says the assumption is at least partly wrong: at the other
+extreme, a full re-read per depth slice (41 x 16.8 = 689 MB, ~2066 MB
+total) puts it at 127 GB/s (v1) / 152 GB/s (v2) — in the same band as
+the plain transposes. The truth is somewhere between, so this kernel is
+moving up to ~1.5x the bytes it needs to. See §4d.
+
+### What this settles, decisively
+
+- **The transposes are the bottleneck.** Full-size transposes (including
+  the two `_cmul` variants, which are transposes) are
+  8511+9598+14865+9291+16304+9494 = **68.1 ms of v1's 121.6 ms (56%)**
+  and 8413+9434+13555+9444 = **40.8 ms of v2's 90.1 ms (45%)**. They run
+  at 139-164 GB/s (60-71% of achievable), and the two `_cmul` variants
+  are worse still.
+- **The FFT row kernels are essentially optimal: 192-224 GB/s, i.e.
+  83-96% of the 232 GB/s ceiling.** Every remaining FFT-kernel idea in
+  this log (radix-16, twiddle tables, `half_lds`, barrier removal) is
+  competing for at most 4-17% of a group of kernels that is only ~24%
+  of runtime — a ceiling of ~2-4% end-to-end. This confirms, with
+  hardware data rather than inference, the conclusion this log reached
+  three separate times by other means. **Stop optimizing the butterfly
+  math.**
+- **The elementwise kernels are also already optimal** (198-229 GB/s).
+  There is nothing to gain by making them faster — only by making them
+  not exist (§3).
+- Register usage is tiny everywhere (VGPR 8-56), LDS is 8.2-16.4 KB, so
+  nothing is occupancy-limited by resources. The transposes' problem is
+  their access pattern and their tiny per-thread work, not resources.
+
+## 3. What rocFFT says about our top-level structure (and what it doesn't)
+
+Read `library/src/tree_node_2D.cpp`, `tree_node_real.cpp`,
+`node_factory.cpp`, `fuse_shim.cpp`, `assignment_policy.cpp`,
+`rtc_transpose_gen.cpp`, `rtc_transpose_kernel.cpp`,
+`device/generator/stockham_gen_{base,rr,cc,rc}.h`, and
+`device/kernels/configs/config_{sbrr,sbcc}.py`.
+
+### Our RTRT structure is the same choice rocFFT makes for this size
+
+rocFFT's 2D scheme preference (`NodeFactory::Decide2DScheme`,
+`Real2DEvenNode::BuildTree_internal`) is:
+
+1. `CS_KERNEL_2D_SINGLE` — whole 2D transform in LDS. Requires
+   `length0*length1*transforms_per_block*8 <= ldsSize/1.5`; at
+   2048x2048 that is 32 MB of LDS. Not applicable.
+2. `CS_2D_RC` / `INPLACE_SBCC` — row FFT then a **Stockham Block Column
+   Common (SBCC)** kernel for the column dimension, with **no transposes
+   at all** (2 kernels). Requires `has_SBCC_kernel(length[1])`.
+3. `CS_2D_RTRT` / `TR_PAIR` — row FFT, transpose, row FFT, transpose.
+   Explicitly the "last resort".
+
+**`config_sbcc.py` tops out at length 512.** So for H=2048,
+`has_SBCC_kernel(2048)` is false and rocFFT falls all the way through to
+RTRT — exactly what `rfft2_batched_gpu`/`irfft2_batched_gpu` already do.
+
+rocFFT also has a fuse shim that *would* absorb the transpose into the
+row-FFT kernel by simply making it write with the transposed output
+stride (`RTFuseShim`, `FT_STOCKHAM_WITH_TRANS` — no extra LDS, no extra
+kernel). It is gated by `canOptimizeWithStride`, which demands
+`transforms_per_block >= 8` for single precision ("ensure we are doing
+enough rows to coalesce properly"). For length 2048,
+`transforms_per_block == 1`, so **rocFFT does not fuse the transpose
+either.**
+
+This is worth stating plainly because it retires a family of ideas:
+- The earlier "eliminate the transpose via strided row-FFT" experiment
+  (reverted, 28% slower) failed for the right reason. Its
+  uncoalesced `W2`-strided writes are precisely what SBCC avoids by
+  giving each block many adjacent columns — and the reason rocFFT can't
+  use SBCC at 2048 is that `transforms_per_block * length * 8 bytes`
+  won't fit in LDS with enough columns to coalesce (16 columns x 2048 x
+  8 B = 256 KB vs 64 KB available). **A transpose-free single-pass
+  column FFT is not possible at H=2048.** Don't retry it.
+- A two-pass SBCC decomposition (H = 2048 = 64 x 32, rocFFT's `CS_L1D_CC`
+  pattern) *is* possible and transpose-free, but costs two full passes
+  over the (D,H,W2) buffer — 2754 MB — which is the same traffic as the
+  one transpose + one column-FFT pass that §3's cancellation idea leaves
+  behind. Same bytes, far more code. **Don't do it.**
+- Fusing the transpose into the row-FFT's store is not available at this
+  size for the same coalescing reason rocFFT rejects it.
+
+So the structural win has to come from something rocFFT *can't* do,
+because rocFFT is a general FFT library and doesn't get to see the
+surrounding pipeline. That is exactly where the remaining 33% is.
+
+### The big win: cancel the redundant transposes across the rfft2/irfft2 boundary
+
+The kernel sequences are:
+
+```
+rfft2_batched_gpu:            rfft_row(W) -> T_A -> fft_row(H) -> T_B
+irfft2_batched_gpu[_cmul]:    T_A' -> fft_row(H,inv) -> T_B' -> irfft_row(W)
+```
+
+`T_B` maps `(D,H,W2) -> (D,W2,H)`... and `T_A'` maps it straight back.
+**Every `rfft2 -> (elementwise) -> irfft2` chain in the pipeline
+performs a transpose immediately followed by its own inverse.** The
+elementwise multiply between them commutes with the transpose, so both
+can be dropped if the frequency-domain buffers are kept in the
+**transposed `(D, W2, H)` layout as the canonical layout** and
+`psf_fft`/`psft_fft` are precomputed transposed (free — PSF prep is
+outside the timed loop; just drop the final `transpose_kernel` call in
+the `rfft2_batched_gpu` used for PSF setup in `main.mojo`).
+
+This is measured, not modelled: dispatches 4 and 5 in the v1 table
+(`transpose_kernel` 9598 µs + `transpose_kernel_cmul` 14865 µs = **24.5
+ms, 20% of v1's runtime**) are a transpose immediately followed by its
+inverse-with-a-multiply-folded-in.
+
+### Four concrete restructurings, with measured payoff
+
+Ordered by measured value. All four preserve bit-exact arithmetic (no
+reassociation, no reordering of any float operation — only the *layout*
+of intermediate buffers and which kernel does the load/store changes),
+so `test_openflr_gpu` / `verify_correctness.py` should report identical
+`max|diff|` values, which makes each one cheap to validate.
+
+**(a) Transposed canonical spectrum + fuse forward column FFT, complex
+multiply, and inverse column FFT into a single kernel.** (v1's first
+chain.) Both column FFTs operate on the *same* `(D*W2, H)` rows. In one
+kernel: load the row into LDS, forward FFT, multiply by
+`psf_fft_T[d,w,:]`, inverse FFT, store. One LDS residency instead of two
+kernels plus two transposes plus an intermediate global buffer.
+
+Replaces v1 dispatches 3,4,5,6 (7079+9598+14865+6832 = **38.4 ms**) with
+one kernel moving 2066 MB, which at the 195-202 GB/s the existing column
+kernels already achieve is **~10.3 ms**. **Saves ~28.0 ms (23% of v1).**
+
+**(b) Fuse the broadcast complex multiply into the inverse column FFT's
+load** instead of into a transpose. With `psft_fft` stored as
+`(D,W2,H)` and `rfft2_batched_gpu_div` emitting `(1,W2,H)` (drop its
+final transpose — a ~34 MB kernel), the leading transpose disappears
+entirely and the multiply happens at the point the inverse column FFT
+first reads each element.
+
+Replaces v1 dispatches 11,12 (16304+6850 = **23.2 ms**) with one kernel
+moving ~1394 MB at ~200 GB/s = **~7.0 ms**. **Saves ~16.2 ms (13% of
+v1).** Same change in v2 replaces dispatches 9,10 (13555+6807 = 20.4 ms)
+with ~7.0 ms, **saving ~13.4 ms (15% of v2)**.
+
+One implementation detail that decides whether this actually hits
+~1394 MB: the fused kernel's grid is `D*W2` rows, and the broadcast
+operand row `err_fft_T[w, :]` is shared by all `D` blocks with the same
+`w`. Launched naively (`row = block_idx.x`, i.e. `w` fastest over the
+`(D, W2, H)` layout) those `D` blocks are scheduled `W2` apart and the
+16.8 MB operand gets swept `D` times — reintroducing exactly the ~689 MB
+of avoidable traffic §4d diagnoses in the kernel this replaces. Map the
+block index so `d` is fastest instead (`d = block_idx.x % D`,
+`w = block_idx.x / D`, buffer row `d*W2 + w`); that keeps the 16 KB
+shared row hot in L1 across all 41 blocks and needs no layout change.
+
+**(c) Fuse the final elementwise multiply into `irfft_row_kernel`'s
+store.** v1's `shift_mul_kernel` (10411 µs) and v2's
+`elementwise_mul_kernel` (9009 µs) each read a full `(D,H,W)` buffer
+that the immediately preceding `irfft_row_kernel` just wrote. Fold it
+in: the kernel already holds the finished row in LDS. For v1 the
+fftshift is a pure index rotation — the row rotation picks the
+destination row (`r = (rr + H/2) % H`) and the column rotation makes the
+store two contiguous half-row segments, so both the `data` read and the
+`out` store stay coalesced.
+
+Replaces v1 dispatches 14,15 (6151+10411 = **16.6 ms**) with one kernel
+moving 2064 MB at ~220 GB/s = **~9.4 ms**. **Saves ~7.2 ms (6% of v1)**;
+v2 dispatches 12,13 (6155+9009 = 15.2 ms) -> ~9.2 ms, **saving ~6.0 ms
+(7% of v2)**.
+
+This is the same trick as the already-kept `shift_mul_kernel` fusion,
+pushed one kernel further up the chain.
+
+**(d) Fuse the complex multiply into `sum_over_depth_kernel`** (v2
+only). `complex_mul_kernel` writes the pipeline's largest buffer
+`(D,H,W2)` complex and `sum_over_depth_kernel` reads all of it back just
+to reduce over depth. **Crucially, this needs no atomics**: the existing
+`sum_over_depth_kernel` already walks `b in range(D)` reading
+`x[b*hw + i]` in a per-thread register accumulator, so folding the
+multiply into that loop costs nothing extra and the whole product buffer
+disappears — write *and* read-back.
+
+This is the fusion the earlier "atomic-accumulate fusion of the
+depth-sum reductions" experiment was reaching for, but it got there the
+expensive way: that attempt put the reduction in the *producer*
+(`complex_mul_sum_depth_kernel` atomically accumulating into a pre-zeroed
+accumulator), which needed `D=41` atomics contending per output element
+and measured 1-5% *slower*. Doing it in the *consumer* instead needs no
+atomics at all. The earlier session's note that "the same fusion could
+plausibly be a net win on H100" is beside the point — it can be a win
+here, in a form that never touches an atomic.
+
+Replaces v2 dispatches 5,6 (9606+3200 = **12.8 ms**) with one kernel
+moving ~1394 MB at ~220 GB/s = **~6.3 ms**. **Saves ~6.5 ms (7% of v2).**
+
+### Projected result
+
+Summing the measured per-dispatch numbers with (a)-(d) applied:
+
+| | current | projected | speedup |
+|---|---|---|---|
+| v1 | 0.1216 s | **~0.070 s** | 1.7x |
+| v2 | 0.0900 s | **~0.055 s** | 1.6x |
+
+Traffic drops from 20.15 -> ~13.4 GB (v1) and 16.12 -> ~10.7 GB (v2),
+about **-33% each**, and kernel count per iteration drops from 19 to 14
+(v1) and 19 to 15 (v2). At that point the pipeline would be running at a
+*higher* fraction of its hardware's bandwidth than any torch/jax number
+in §0's table.
+
+Suggested order of attack: (b) and (d) are the best value-per-line and
+are independent of each other; (c) is straightforward; (a) is the
+biggest single win but the most involved (it needs a new fused kernel and
+the transposed-canonical-layout change threaded through
+`OpenFlrScratch` and both `run_v*_step_gpu`). All four share the
+transposed-layout prerequisite except (c) and (d).
+
+## 4. rocFFT's transpose kernel vs ours
+
+Even after §3, three full-size transposes remain in v1 (~27.3 ms at
+143-162 GB/s) and two in v2 (~17.9 ms). rocFFT's transpose
+(`rtc_transpose_gen.cpp`, `rtc_transpose_kernel.cpp`) differs from
+`transpose_kernel` in four ways.
+
+**(a) Tile shape and elements per thread — the top micro-optimization.**
+rocFFT single precision uses `tileX = 64, tileY = 16`, block `(64,16)` =
+1024 threads, LDS tile `64 x 64`, and therefore
+`elems_per_thread = tileX/tileY = 4`, with `#pragma unroll` on the read,
+LDS-transpose, and write loops. Ours is `TILE=32`, block `(32,32)` =
+1024 threads, **1 element per thread per plane**.
+
+Our threads each move 8 bytes (one float from `re`, one from `im`) per
+phase. That is far too little to build up memory-level parallelism: the
+kernel spends its time on index arithmetic and one round of load
+latency it can't hide. rocFFT's threads have 4 independent loads in
+flight, and its 64-wide tile rows are 64 contiguous elements (256 B per
+plane) instead of 32 (128 B). Given that our transposes sit at 60-71%
+of achievable while every kernel that does more work per thread sits at
+83-96%, this is the most likely single explanation. **Highest-value
+micro-optimization; try `TILE=64` with block `(64,16)` and 4 elements
+per thread first.**
+
+**(b) Interleaved (AoS) complex storage.** rocFFT's internal temp buffers
+are always `rocfft_complex<T>` (interleaved); planar layout is only a
+user-facing option, implemented by a late `make_planar` source
+transform. Our buffers are all separate `re`/`im` `DeviceBuffer`s.
+Interleaving halves the number of memory instructions and address
+computations and the number of concurrently-open DRAM streams. Note the
+correction to the earlier untested write-up in this log: SoA does *not*
+halve the achievable bandwidth — both `re` and `im` rows are separately
+coalesced — so the upside is instruction count and stream count, not
+bytes. Bounded by the ~1.4x headroom on these kernels. **Do it after
+(a), and only if (a) doesn't already close the gap** — it touches every
+buffer and kernel signature in `fft_gpu.mojo`/`openflr_gpu.mojo`.
+
+**(c) Row-pitch padding — and the earlier padding experiment padded the
+wrong thing.** rocFFT pads intermediate buffer *strides*
+(`AssignmentPolicy::PadStride`, `assignment_policy.cpp:948`):
+
+```
+needsPadding = ((smallerDim % 64 == 0) || (biggerDim % 64 == 0))
+               && (biggerDim >= 512);
+static const size_t padding = 64;   // elements, added to the highest dim's stride
+```
+
+i.e. for a `(W2, H)` temp buffer it would allocate row pitch `H + 64 =
+2112` rather than `2048`. The earlier "W2-padding to fix transpose
+asymmetry" experiment (reverted, made things worse) padded `W2`
+1025 -> 1056 — a *length*, on the dimension that was already not a power
+of two. rocFFT's rule pads the *stride* on the dimension that *is* a
+power of two. That is a different change and was never tried.
+
+It is likely redundant with the diagonal remap already in the tree —
+note that rocFFT enables its own diagonal reordering only when
+`(fastOut % 256) == 0 && (node.outStride[0] % 256 == 0)`
+(`rtc_transpose_kernel.cpp:88`), and a padded pitch of 2112 fails that
+test (2112 % 256 = 64), so in rocFFT the two are **alternatives, not
+complements**. Independent confirmation of the partition-camping
+diagnosis this log root-caused: rocFFT's threshold is exactly "the
+destination's fast axis and row stride are multiples of 256". Low
+priority — try it only as an A/B against the diagonal remap, not as an
+addition.
+
+Also worth a one-line change: our diagonal remap is applied
+unconditionally, including on the direction whose destination fast axis
+is `W2 = 1025` (not a power of two), where rocFFT would skip it. Gating
+it on a comptime `is_pow2(dest_fast_axis)` costs nothing and removes
+dead integer work from half the transpose calls.
+
+**(d) `transpose_kernel_cmul_broadcast` is the worst kernel in the
+pipeline (85-103 GB/s) and its grid ordering is why.** It launches
+`grid = (ceildiv(W2,TILE), ceildiv(H,TILE), D)` with depth as the
+*slowest*-varying dimension, and the broadcast `(H,W2)` operand is
+indexed `a_re[y, x]` — independent of `block_idx.z`. So all 41 depth
+slices read the same 16.8 MB of `a`, but consecutively-scheduled blocks
+share a `z` and sweep the whole of `a` before `z` advances. 16.8 MB
+would fit this APU's 32 MB MALL/Infinity Cache on its own — but the
+kernel simultaneously streams ~1.4 GB through that cache (`b` in, `dst`
+out), so `a` is repeatedly evicted between one `z` and the next.
+Charging a full re-read per slice (+689 MB) puts the kernel at
+127 GB/s (v1) / 152 GB/s (v2), i.e. right in the plain-transpose band —
+so the deficit is extra *traffic*, not a slow kernel. Direct evidence
+that this is cache-state-dependent: the identical kernel on identical
+data takes 16.3 ms in v1 and 13.6 ms in v2, a 20% spread no other
+kernel in either trace shows.
+
+**Making depth the fastest-varying grid dimension** (swap `z` into `x`,
+or fold `D` into the tile index so the 41 blocks sharing an `a` tile are
+scheduled together) would let the 16.8 MB operand be read once instead
+of up to 41 times — worth up to ~4 ms in v1 and ~3 ms in v2 on its own. It is a small change to a
+kernel §3(b) proposes to delete outright, so its main value is as a
+cheap standalone win to bank first, or as a fallback if §3(b) stalls.
+Either way the same broadcast-reuse hazard applies to §3(b)'s
+replacement fused column-FFT kernel, which reads the same broadcast
+operand — **get the grid ordering right there from the start**. Note the
+diagonal remap in `transpose_kernel` only permutes `x`/`y`, so it does
+not conflict with folding `D` into the fastest-varying axis.
+
+One place we are *better* than rocFFT: rocFFT's LDS tile is unpadded
+`tileX x tileX`, so its LDS *write* (`lds[threadIdx.x][...]`, stride
+`tileX` complex) is bank-conflicted; ours pads to `TILE+1` and is
+conflict-free on both the write and the transposed read. Keep the
+padding when moving to a 64x64 tile (`row_major[64, 65]()` → 2 x 64 x 65
+x 4 = 33.3 KB, which fits, but check occupancy; if it hurts, the
+alternative is a 64x64 tile of interleaved complex with a different
+padding).
+
+## 5. rocFFT row-kernel techniques — recorded, but deprioritized
+
+These are the substantive differences between rocFFT's Stockham kernels
+and our row kernels. §2 shows our row kernels are at 83-96% of
+achievable bandwidth, so **the total available win from this entire
+section is ~2-4% end-to-end.** Recorded for completeness and in case the
+work is ever ported to a compute-bound GPU, but none of it should be
+attempted before §3.
+
+- **Stockham autosort: no bit-reversal permutation, anywhere.** This is
+  the most interesting one. rocFFT's global load
+  (`stockham_gen_rr.h:load_from_global`) is linear and fully coalesced —
+  `idx = thread + h*width`, `LoadGlobal{buf, offset + idx*stride0}`.
+  The self-sorting is achieved purely by asymmetric LDS indexing between
+  passes: store at
+  `(tid/cumheight)*(width*cumheight) + tid%cumheight + w*cumheight`,
+  load at `tid + w*length/width`. Our kernels open with a **bit-reversed
+  global gather** (`src_a = bit_reverse_ct(pos_a, log2n)`), where
+  consecutive lanes in a warp read addresses 64 elements (256 B) apart —
+  32 distinct cache lines per instruction. The row (8 KB/plane) fits in
+  L0/L1 so the *bytes* are not amplified, but the address-coalescing
+  hardware issues 32 requests where it could issue 1-2. Measured at
+  219-224 GB/s, the ceiling here is ~4%; still, this is the cleanest
+  structural improvement available in the row kernels if anyone wants
+  it, and it would also delete `bit_reverse_ct` from the hot path.
+- **Mixed radix, very few passes.** For length 2048,
+  `config_sbrr.py:456` specifies `workgroup_size=256`,
+  `threads_per_transform=256`, `factors=(16, 16, 8)` — **3 passes**,
+  8 elements per thread held in registers, radix-16 butterflies done
+  entirely in registers with hardcoded internal twiddles
+  (`rocfft_butterfly_template.h:FwdRad16B1`). Ours: 1024 threads, **2
+  elements per thread**, 11 radix-2 stages (6 warp-shuffle + a radix-4
+  fused tail). rocFFT does roughly 3x fewer twiddle multiplies. Note
+  rocFFT's choice of a **256-thread block with 8 elements per thread**
+  is the same "more work per thread" principle as §4(a); our 1024-thread,
+  2-element-per-thread configuration is the opposite everywhere.
+- **`half_lds`** (default `True` for `CS_KERNEL_STOCKHAM`): between
+  passes, store/load only the real component, then only the imaginary,
+  halving LDS per transform (16 KB -> 8 KB for N=2048) at the cost of
+  ~2 extra barriers per pass boundary. Doubles occupancy headroom.
+- **`direct_to_from_reg`** (default `True`): the first pass loads
+  global -> registers directly and the last pass stores registers ->
+  global directly, skipping two LDS round trips. Our warp-shuffle fast
+  path already does the load half of this; worth checking whether the
+  radix-4 tail's final stage writes to LDS only to be re-read for the
+  global store, which would be a free removal.
+- **Precomputed per-radix twiddle tables** (`twiddles.cpp`), sized
+  `sum over passes of (radix-1)*cumheight` rather than the full `N`.
+  This log's earlier twiddle-table experiment used a full-length table
+  and measured neutral-to-slower; the per-radix table is far smaller and
+  LDS-friendly. Still bounded by the ~4% ceiling above.
+- **Buffer-load/store intrinsics** (`IntrinsicLoad`/`IntrinsicStore`,
+  `llvm.amdgcn.raw.buffer.*`) let rocFFT use hardware bounds-checking
+  instead of `if` guards, removing branches from the load/store path.
+  AMD-specific; unclear whether Mojo exposes an equivalent.
+- **Callbacks / `load_store_ops`.** rocFFT lets callers fuse arbitrary
+  elementwise work into any kernel's load and store via callbacks
+  (`callback_h`, `LoadGlobal`/`StoreGlobal`), plus a built-in
+  `scale_factor` store op. Our equivalent is hand-written kernel variants
+  (`rfft_row_kernel_div`, `transpose_kernel_cmul`,
+  `transpose_kernel_cmul_broadcast`, ...), and §3 would add three more.
+  **Worth considering a comptime load-op/store-op closure parameter on
+  the row and transpose kernels** before writing those three by hand —
+  same performance, far less duplicated kernel body. This is a
+  maintainability argument, not a performance one, but §3 is about to
+  make the duplication noticeably worse.
+
+## 6. Measurement gaps worth closing
+
+- **No same-hardware torch/JAX baseline.** `../results.md` compares Mojo
+  on gfx1151 against torch/jax on NVIDIA parts; the installed
+  `.venv` torch is a CUDA build. Installing a ROCm torch (or
+  jax-rocm) and running `main.py` on this machine would turn §0's
+  bandwidth-normalized argument from an inference into a direct
+  measurement — and is the single most informative thing left to
+  measure.
+- **No same-hardware expert-FFT reference.** rocFFT 7.2.0 is installed
+  (`/opt/rocm/lib/librocfft.so`), `hipcc` is present, and the source
+  checkout includes `clients/bench`. Timing a batched
+  `2048 x 2048` real-to-complex transform at batch 41 through rocFFT
+  directly would give the hardware-achievable floor for the FFT stages
+  specifically, and `ROCFFT_LAYER` plan printing would confirm on this
+  exact problem that rocFFT picks RTRT (as §3 predicts from the source).
+  That turns "our structure matches rocFFT's choice" from a code reading
+  into a verified fact.
+- **Hardware counters, not just timings.** `rocprofv3` works; §4's
+  claims about the `_cmul_broadcast` cache behaviour and the transposes'
+  memory-level parallelism are inferred from achieved-bandwidth
+  arithmetic and could be confirmed directly with DRAM/L2/MALL counters
+  (`rocprofv3-avail` lists what gfx1151 exposes).
+
+## 7. Aside: v1 and v2 are mathematically the same computation
+
+Not an optimization proposal — the two formulations are the benchmark's
+subject, so this should not be "fixed" — but worth recording. v1
+computes `denominator = sum_d(irfft2(PSF_fft * rfft2(data)))` and v2
+computes `denominator = irfft2(sum_d(PSF_fft * rfft2(data)))`. Because
+`irfft2` is linear, these are identical up to float rounding; v2 just
+does the depth reduction while the data is still `(D,H,W2)` complex,
+performing one inverse 2D transform instead of `D=41` of them. That is
+the whole reason v2 is ~26% faster, and it is the same class of
+optimization as §3 — moving work to where the buffer is smallest.
+
+---
+
+# Session: sec. 3(a) implemented — transposed canonical spectrum + fused forward-FFT / complex-multiply / inverse-FFT column kernel
+
+Brief: implement the highest-value item from the rocFFT-guided session's
+sec. 3 — restructuring (a). Hardware unchanged: AMD gfx1151 (Radeon 8060S /
+Ryzen AI MAX+ PRO 395, 40 CU, wave32, LPDDR5X unified memory, ~232 GB/s
+achievable).
+
+## Result
+
+| | before | after | speedup |
+|---|---|---|---|
+| v1 | 0.1213 s | **0.0948 s** | **1.28x** |
+| v2 | 0.0906 s | **0.0812 s** | **1.12x** |
+
+Both baselines were re-measured on this machine rather than taken from the
+log (they agree with the recorded 0.1197 / 0.0900 to within the run-to-run
+spread). 20 iterations per run; the "after" column is the median of four v1
+runs (0.0937, 0.0948, 0.0964, 0.0974) and three v2 runs (0.0802, 0.0818,
+0.0820). This APU drifts a few percent between runs — enough to matter when
+reading a single number, not enough to touch a 20-28% change. v1's
+per-dispatch model in sec. 3(a) predicted 0.0936 s, the low end of what was
+measured.
+
+Correctness is unchanged and bit-identical to every previous revision:
+`verify_correctness.py` still reports `max abs diff = 6.676e-06`,
+`mean 1.108e-06`, `max rel 5.269e-07` for both v1 and v2 against the full
+numpy reference at (41, 2048, 2048) — the same numbers recorded earlier in
+this log. `test_openflr_gpu` reports `8.940697e-08` for both, and the whole
+CPU/GPU FFT suite passes. This is expected: nothing about the arithmetic or
+its order changed, only which buffer layout intermediates live in and which
+kernel performs each load/store.
+
+## What was built
+
+**The canonical frequency-domain layout for the forward chain is now the
+transposed `(D, W2, H)` one.** Both `rfft2 -> elementwise -> irfft2` chains
+used to run `transpose (D,H,W2)->(D,W2,H)` immediately followed by its own
+inverse, with only an elementwise multiply — which commutes with a
+transpose — in between. Keeping the spectrum transposed deletes both.
+
+**`fft_row_cmul_ifft_kernel`** (`fft_gpu.mojo`) then collapses what is left
+of v1's first chain. Forward height-axis FFT, complex multiply by
+`psf_fft_T`, and inverse height-axis FFT all happen in one shared-memory
+residency, so the intermediate spectrum never reaches global memory. The
+body is a `comptime for` over the two passes; the passes share the entire
+stage schedule (warp-shuffle head + fused radix-4 tail, unchanged from
+`fft_row_kernel`) and differ only at the two ends:
+
+- the forward pass opens with the usual bit-reversed gather from global,
+  and closes by multiplying the finished spectrum by `p` and leaving it in
+  shared memory;
+- the inverse pass opens with the same bit-reversed gather out of *shared*
+  memory, and closes with the usual `1/N`-scaled global store.
+
+New host-side drivers, all in `fft_gpu.mojo`: `rfft_w_transposed_gpu`,
+`irfft_w_from_transposed_gpu`, `fft_col_cmul_ifft_gpu`,
+`rfft2_batched_gpu_t`, `irfft2_batched_gpu_t`. `psf_fft` is precomputed
+transposed by `prepare_psf` (free — PSF prep is outside the timed loop);
+`psft_fft` is untouched, since the back-projection chain still runs in the
+`(D, H, W2)` layout.
+
+v2 got the transposed canonical layout too, though not the fusion: its
+frequency-domain step is a multiply plus a depth reduction, not an inverse
+column FFT, so there is nothing to fuse the forward FFT into. What v2 gains
+is the same pair of cancelled transposes — the final transpose of `rfft2`
+(9.4 ms) and the leading transpose of the small `(1, H, W)` `irfft2`.
+`complex_mul_kernel` and `sum_over_depth_kernel` needed no changes at all:
+both are flat over the buffer and are blind to which of the last two axes
+is fastest.
+
+### The one non-obvious detail: a shared-memory swizzle for the hand-off
+
+The inverse pass's opening gather is bit-reversed, and reading that pattern
+straight out of shared memory is a **32-way bank conflict**. For `N = 2048`
+(`log2n = 11`), warp `w` lane `l` wants the element at
+`bit_reverse(64w + l) == 64*rev5(l) + rev5(w)`, so every lane in the warp
+lands on bank `rev5(w)` — the same one. Four such loads (`a_re, a_im, b_re,
+b_im`) per thread, serialized 32 ways, is roughly 1.7 ms of pure LDS stall
+per iteration by a rough cycle count — an eighth of the win, thrown away at
+the seam.
+
+`lds_swizzle(i) = i ^ ((i >> 6) & 31)` fixes it. It only moves bits 0-4, so
+an element never leaves its own 32-element aligned block (the permutation
+is a bijection, and an involution); the gather's bank becomes
+`rev5(w) ^ rev5(l)`, distinct for all 32 lanes. The multiply at the end of
+the forward pass writes in swizzled order, the inverse pass's gather reads
+in swizzled order, and everything in between is untouched natural-order
+indexing. For `N < 64` it is the identity, so the small-`N` (non-warp) path
+gets it for free and the `D=3, H=8, W=8` test still exercises that branch.
+
+Both the multiply and the inverse pass's gather are permutations of shared
+memory performed in place, so each gathers into registers, hits a
+`barrier()`, and only then stores — two extra barriers per row, against
+four global round trips removed.
+
+## Measured per-kernel breakdown after the change (rocprofv3, one
+steady-state iteration)
+
+### v1 — 94.6 ms total, 15 dispatches (was 121.6 ms, 19 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6271 | 1377 | 220 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8422 | 1377 | 164 |
+| 3 | **`fft_row_cmul_ifft_kernel`** | **10855** | **2066** | **190** |
+| 4 | `transpose_kernel` (W2,H)->(H,W2) | 9407 | 1377 | 146 |
+| 5 | `irfft_row_kernel` (W) | 6424 | 1377 | 214 |
+| 6 | `sum_over_depth_real_kernel` | 3336 | 705 | 211 |
+| 7 | `rfft2_batched_gpu_div` (4 kernels) | 516 | 151 | — |
+| 8 | `transpose_kernel_cmul_broadcast` | 17105 | 1394* | 81* |
+| 9 | `fft_row_kernel` (H, inv) | 6526 | 1377 | 211 |
+| 10 | `transpose_kernel` | 9287 | 1377 | 148 |
+| 11 | `irfft_row_kernel` (W) | 6242 | 1377 | 221 |
+| 12 | `shift_mul_kernel` | 10180 | 2064 | 203 |
+| | **total** | **94571** | **16018** | **169** |
+
+Dispatches 3-6 of the old table (`fft_row(H,fwd)` 7079 + `transpose` 9598 +
+`transpose_cmul` 14865 + `fft_row(H,inv)` 6832 = 38.4 ms) are now the
+single 10.9 ms kernel on row 3. The model predicted 10.3 ms at
+195-202 GB/s; the kernel achieves 190 GB/s, a hair under the plain column
+FFTs, which is the cost of the two extra barriers and the swizzle.
+
+### v2 — 80.7 ms total, 17 dispatches (was 90.1 ms, 19 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6300 | 1377 | 219 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8712 | 1377 | 158 |
+| 3 | `fft_row_kernel` (H, fwd) | 6459 | 1377 | 213 |
+| 4 | `complex_mul_kernel` | 9686 | 2066 | 213 |
+| 5 | `sum_over_depth_kernel` | 3219 | 705 | 219 |
+| 6 | `irfft2_batched_gpu_t` (3 kernels) | 419 | 118 | — |
+| 7 | `rfft2_batched_gpu_div` (4 kernels) | 596 | 151 | — |
+| 8 | `transpose_kernel_cmul_broadcast` | 14046 | 1394* | 99* |
+| 9 | `fft_row_kernel` (H, inv) | 6618 | 1377 | 208 |
+| 10 | `transpose_kernel` | 9350 | 1377 | 147 |
+| 11 | `irfft_row_kernel` (W) | 6215 | 1377 | 222 |
+| 12 | `elementwise_mul_kernel` | 9057 | 2064 | 228 |
+| | **total** | **80677** | **14760** | **183** |
+
+\* Same caveat as the original table: the `_cmul_broadcast` MB figure counts
+the broadcast operand once.
+
+Traffic: 20.15 -> 16.02 GB (v1, -20%) and 16.12 -> 14.76 GB (v2, -8%).
+Against sec. 0's bandwidth-normalized table, the pipeline now runs at 67%
+(v1) and 72% (v2) of this GPU's *theoretical* 256 GB/s — 74% and 79% of the
+measured 232 GB/s achievable — putting both at or above the top of the
+51-76% band every torch/JAX number on every NVIDIA part occupies.
+
+## What this changes about the remaining plan in sec. 3
+
+- **(b) — fuse the broadcast complex multiply into the inverse column FFT's
+  load — is now unambiguously the top remaining item, and it got *bigger*.**
+  `transpose_kernel_cmul_broadcast` is still the worst kernel in the
+  pipeline by a wide margin (81 GB/s in v1, 99 GB/s in v2) and now accounts
+  for **18% of v1** and **17% of v2** all by itself. Dispatches 8+9 are
+  23.6 ms (v1) and 20.7 ms (v2); one fused kernel moving ~1394 MB at
+  ~200 GB/s is ~7.0 ms, so **~16.6 ms (18% of v1) and ~13.7 ms (15% of
+  v2)**. The infrastructure this session built makes it much cheaper than
+  the original estimate: the transposed-layout prerequisite is done, and
+  `fft_row_cmul_ifft_kernel` is a working template for "gather a row, do
+  elementwise work against a second operand, transform, store" — the
+  broadcast variant is the same kernel with the multiply moved to the
+  *load* and only the inverse pass kept. Note that v1's dispatch 8 got
+  ~5% *slower* than the pre-change trace (17.1 ms vs 16.3 ms) even though
+  nothing about it changed, which is more evidence for sec. 4(d)'s
+  cache-eviction diagnosis: the kernels around it now stream different
+  buffers, so the broadcast operand's residency shifted. **Get the grid
+  ordering right (`d` fastest) in the replacement, per sec. 3(b).**
+- **(c) — fuse the final elementwise multiply into `irfft_row_kernel`'s
+  store — is unchanged and still worth ~7 ms (v1) / ~6 ms (v2).** It is
+  independent of everything above.
+- **(d) — fuse the complex multiply into `sum_over_depth_kernel` (v2 only)
+  — is unchanged and still worth ~6.5 ms.** Dispatches 4+5 are 12.9 ms;
+  one kernel moving ~1394 MB at ~220 GB/s is ~6.3 ms.
+- **The remaining plain transposes are now a larger share of what is left**:
+  17.8 ms of v1 (19%) and 18.1 ms of v2 (22%), still at 146-164 GB/s
+  against a 232 GB/s ceiling. After (b)/(c)/(d), sec. 4(a) — `TILE=64`,
+  block `(64,16)`, 4 elements per thread — becomes the top item, worth up
+  to ~1.4x on those two kernels, i.e. ~5 ms each version.
+- **sec. 5 is unaffected**: the row kernels are still 208-222 GB/s, and the
+  new fused kernel at 190 GB/s is the closest thing in the pipeline to a
+  compute-limited kernel. If anything, the extra barrier pressure inside it
+  makes `half_lds` and the barrier-count ideas slightly more attractive
+  than before — but still bounded by a few percent.
+
+Projected if (b), (c) and (d) all land on top of this:
+v1 ~0.070 s, v2 ~0.055 s — the same endpoint sec. 3 projected, now with
+the largest and riskiest piece already banked.
+
+**Same standing caveat as every finding in this log:** measured on a
+bandwidth-constrained iGPU. The *structural* part of this change (fewer
+kernels, fewer bytes, no redundant transposes) is architecture-generic and
+should help anywhere. The *fusion* part trades global traffic for shared
+memory pressure and barriers, which is a strictly better trade on this GPU
+and very likely on H100 too, but the margin there is unmeasured.
+
+# Session: sec. 3(b) implemented — broadcast complex multiply fused into the inverse column FFT's load
+
+Brief: implement the top remaining item from the rocFFT-guided session's
+sec. 3 — restructuring (b), which the previous session's closing notes flagged
+as "unambiguously the top remaining item, and it got *bigger*". Hardware
+unchanged: AMD gfx1151 (Radeon 8060S / Ryzen AI MAX+ PRO 395, 40 CU, wave32,
+LPDDR5X unified memory, ~232 GB/s achievable).
+
+## Result
+
+| | before | after | speedup |
+|---|---|---|---|
+| v1 | 0.0950 s | **0.0798 s** | **1.19x** |
+| v2 | 0.0817 s | **0.0686 s** | **1.19x** |
+
+Both baselines were re-measured on this machine before touching anything and
+agree with the previous session's recorded 0.0948 / 0.0812. 20 iterations per
+run; both columns are medians of five runs (v1 after: 0.0795, 0.0796, 0.0798,
+0.0800, 0.0803; v2 after: 0.0685, 0.0685, 0.0686, 0.0687, 0.0688). The spread
+is well inside the few-percent drift this APU shows between runs.
+
+Cumulative over the last two sessions: **v1 0.1213 -> 0.0798 (1.52x), v2
+0.0906 -> 0.0686 (1.32x)**.
+
+## What was built
+
+**`ifft_row_cmul_broadcast_kernel`** (`fft_gpu.mojo`) replaces the
+`transpose_kernel_cmul_broadcast -> fft_row_kernel(H, inv)` pair outright. The
+transpose existed only to get the two operands from the `(D, H, W/2+1)` layout
+into the `(D, W/2+1, H)` one the column FFT needs; with both operands already
+transposed there is nothing left for it to do, and the broadcast complex
+multiply it was carrying costs nothing folded into the inverse FFT's opening
+bit-reversed gather — a load the kernel was performing anyway. Two dispatches
+moving ~2066 MB become one moving ~1394 MB.
+
+Getting the operands transposed took two supporting changes, both free:
+
+- `psft_fft` is now precomputed by `rfft2_batched_gpu_t` instead of
+  `rfft2_batched_gpu`, so the back-projection PSF spectrum joins `psf_fft` in
+  the transposed canonical layout. PSF prep is outside the timed loop, so this
+  is a pure drop of one transpose from setup.
+- `rfft2_batched_gpu_div_t` (with `rfft_w_div_transposed_gpu` underneath) is
+  `rfft2_batched_gpu_div` stopping one transpose early, exactly as
+  `rfft2_batched_gpu_t` relates to `rfft2_batched_gpu`. That deletes one
+  `(1, H, W/2+1)` transpose per iteration from the small four-kernel group.
+
+With this, **every frequency-domain buffer in the pipeline is now in the
+transposed `(D, W/2+1, H)` layout**; sec. 3(a)'s note that "only the forward
+chain has been moved to the transposed layout" no longer applies, and the
+`_t`-suffixed drivers are the only ones the pipeline uses.
+
+New host driver `irfft2_batched_gpu_cmul_broadcast_t`: three dispatches
+(fused inverse column FFT, transpose, `irfft_row_kernel`) where
+`irfft2_batched_gpu_cmul_broadcast` had four.
+
+### The grid ordering is worth as much as the fusion's last third
+
+Sec. 3(b) predicted that mapping `row = block_idx.x` naively over the
+`(D, W2, H)` layout — `w` fastest — would schedule the `D` blocks sharing a
+broadcast row `W2` apart and sweep the 16.8 MB operand `D` times. That
+prediction is now measured, by building the kernel both ways:
+
+| block-index mapping | v1 | v2 |
+|---|---|---|
+| `d` fastest (`d = block_idx.x % D`) | **0.0798 s** | **0.0686 s** |
+| `w` fastest (`w = block_idx.x % W2`) | 0.0828 s | 0.0718 s |
+
+The `w`-fastest ordering costs 2.9 ms (v1) and 3.2 ms (v2) end-to-end. A full
+re-sweep of the broadcast operand is `41 x 16.8 = 689` MB, which at the
+232 GB/s ceiling is 3.0 ms — the model and the measurement agree closely
+enough to consider sec. 4(d)'s cache-eviction diagnosis confirmed. **Two lines
+of index arithmetic are worth a third of this restructuring's total win.**
+
+### Cleanup: the FFT stage schedule is now written once
+
+Adding a third kernel that needed the full radix-2 stage schedule would have
+made three near-identical 250-line copies of it. Instead the schedule is now
+two helpers, used by all three:
+
+- **`fft_warp_head[invert]`** — the six register-resident stages
+  (`stage_half = 1..32`, five `shuffle_xor` stages plus the purely local
+  stage-32 combine). Independent of `N`: it only ever touches one warp's own
+  64 elements.
+- **`fft_lds_stages[N, first_stage, invert]`** — the fused radix-4 pairs and
+  the leftover odd stage, over a row already in shared memory. `first_stage`
+  is 6 after the warp head, 0 on the `N < 64` fallback path.
+
+`fft_gpu.mojo` went from 2272 to 2275 lines while gaining a kernel and three
+drivers. The refactor was verified to produce **bit-identical** full-scale
+output, so it is a pure restructuring; benchmarks before and after it are the
+same to within run-to-run noise (no inlining regression).
+
+## Correctness
+
+**Bit-identical to the previous revision.** The decisive check is Mojo against
+Mojo: dumping the full `(41, 2048, 2048)` single-step output before and after
+the change and comparing the raw `uint32` bit patterns gives an exact match
+for both v1 and v2. Since sec. 3(b) only moves which kernel performs each
+load/store — the same products in the same order, then the same stage
+schedule — that is the expected result, and it is a stronger statement than
+any tolerance against a reference. `test_openflr_gpu` reports `8.940697e-08`
+for both versions and the whole CPU/GPU FFT suite passes, all unchanged.
+
+**Caveat on `verify_correctness.py`: it could not be run this session.** The
+repository's `.venv` is mid-migration from a CUDA to a ROCm torch/jax stack
+(uncommitted edits to `pyproject.toml`/`.python-version`, and
+`.venv/lib/python3.14/site-packages` is empty), so `main.py`'s module-level
+`import jax` / `import torch` cannot resolve. A numpy-only standalone
+equivalent — same reference arithmetic, reading the already-prepared
+`data/*.bin` instead of importing `main.py` — reports `max abs diff 8.18e-06`
+against numpy 1.26.4 and `8.58e-06` against numpy 2.5.2, versus the
+`6.676e-06` recorded earlier in this log. **That spread is the numpy version,
+not the Mojo code**: two numpy builds disagree with each other by more than
+either disagrees with the record, while the Mojo output is bit-for-bit
+unchanged. Re-run `verify_correctness.py` once the venv is rebuilt to restore
+the like-for-like number.
+
+## Measured per-kernel breakdown after the change (rocprofv3, mean of two steady-state iterations)
+
+### v1 — 81.7 ms total, 13 dispatches (was 94.6 ms, 15 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6410 | 1377 | 215 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8860 | 1377 | 155 |
+| 3 | `fft_row_cmul_ifft_kernel` | 11491 | 2066 | 180 |
+| 4 | `transpose_kernel` (W2,H)->(H,W2) | 9413 | 1377 | 146 |
+| 5 | `irfft_row_kernel` (W) | 6453 | 1377 | 213 |
+| 6 | `sum_over_depth_real_kernel` | 3385 | 705 | 208 |
+| 7-9 | `rfft2_batched_gpu_div_t` (3 kernels, (1,H,W)) | 465 | 118 | — |
+| 10 | **`ifft_row_cmul_broadcast_kernel`** | **8412** | **1394** | **166** |
+| 11 | `transpose_kernel` | 9482 | 1377 | 145 |
+| 12 | `irfft_row_kernel` (W) | 6710 | 1377 | 205 |
+| 13 | `shift_mul_kernel` | 10596 | 2064 | 195 |
+| | **total** | **81678** | **14609** | **179** |
+
+Dispatches 8+9 of the old table (`transpose_kernel_cmul_broadcast` 17105 +
+`fft_row_kernel(H,inv)` 6526 = 23.6 ms) are now the single 8.4 ms kernel on
+row 10, and the old four-kernel `rfft2_batched_gpu_div` group is down to three.
+
+### v2 — 69.0 ms total, 15 dispatches (was 80.7 ms, 17 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6324 | 1377 | 218 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8651 | 1377 | 159 |
+| 3 | `fft_row_kernel` (H, fwd) | 7186 | 1377 | 192 |
+| 4 | `complex_mul_kernel` | 9769 | 2066 | 211 |
+| 5 | `sum_over_depth_kernel` | 3248 | 705 | 217 |
+| 6-8 | `irfft2_batched_gpu_t` (3 kernels) | 466 | 118 | — |
+| 9-11 | `rfft2_batched_gpu_div_t` (3 kernels) | 664 | 118 | — |
+| 12 | **`ifft_row_cmul_broadcast_kernel`** | **7839** | **1394** | **178** |
+| 13 | `transpose_kernel` | 9241 | 1377 | 149 |
+| 14 | `irfft_row_kernel` (W) | 6464 | 1377 | 213 |
+| 15 | `elementwise_mul_kernel` | 9133 | 2064 | 226 |
+| | **total** | **68985** | **13350** | **194** |
+
+Traffic: 16.02 -> 14.61 GB (v1) and 14.76 -> 13.35 GB (v2). Note both "before"
+figures were themselves optimistic — they counted the broadcast operand once
+in a kernel that was demonstrably re-sweeping it (the 81/99 GB/s anomaly), so
+the real byte reduction is larger than the -9% the model shows. Against
+sec. 0's normalization the pipeline now runs at 71% (v1) and 76% (v2) of this
+GPU's *theoretical* 256 GB/s, i.e. 79% and 84% of the measured 232 GB/s
+achievable — both now clear of the 51-76% band every torch/JAX number on
+every NVIDIA part occupies.
+
+## What this changes about the remaining plan in sec. 3
+
+- **The plain transposes are now the largest single category, and in v1 they
+  are the obvious next target.** v1 has three full-size transposes left
+  (dispatches 2, 4, 11) totalling **27.8 ms — 34% of v1's runtime** — at
+  145-155 GB/s; v2 has two totalling 17.9 ms (26%) at 149-159 GB/s. Sec. 4(a)
+  (`TILE=64`, block `(64,16)`, 4 elements per thread with unrolled read /
+  LDS-transpose / write loops, as rocFFT does it) is worth up to ~1.4x on
+  these, i.e. **~8 ms on v1 and ~5 ms on v2**. This is now a bigger item than
+  (c) for v1 and comparable for v2, and it is the last idea in this log with a
+  large payoff that does not require restructuring the pipeline.
+- **(c) — fuse the final elementwise multiply into `irfft_row_kernel`'s store
+  — is unchanged and now slightly larger.** v1 dispatches 12+13 are 17.3 ms;
+  one kernel moving 2064 MB at ~220 GB/s is ~9.4 ms, **saving ~7.9 ms (10% of
+  v1)**. v2 dispatches 14+15 are 15.6 ms -> ~9.4 ms, **saving ~6.2 ms (9% of
+  v2)**. Still independent of everything else, still the cheapest thing on the
+  list to write.
+- **(d) — fuse the complex multiply into `sum_over_depth_kernel` (v2 only) —
+  is unchanged and worth ~6.7 ms.** Dispatches 4+5 are 13.0 ms; one kernel
+  moving ~1394 MB at ~220 GB/s is ~6.3 ms. Note the caution below about what
+  rate to expect.
+- **`ifft_row_cmul_broadcast_kernel` itself came in at 166 GB/s (v1) /
+  178 GB/s (v2), under the ~200 GB/s the model assumed** (8.4 ms rather than
+  the projected 7.0 ms). The kernel it replaced ran at 81/99 GB/s, so this is
+  still a large win, but the shortfall is real and has a plausible cause: the
+  `d`-fastest ordering that keeps the broadcast operand cache-resident
+  deliberately makes consecutive blocks read and write the main `(D, W2, H)`
+  stream 8.4 MB apart, trading DRAM locality on the big stream for cache
+  locality on the small one. The measurement above says that trade is worth
+  ~3 ms net, so it is the right call — but **a middle ordering that keeps `d`
+  fast in groups while walking `w` locally (e.g. swizzling within tiles of a
+  few `w` values) might recover part of the remaining ~1.4 ms** and is cheap
+  to try. It also means the ~220 GB/s assumed for (c) and (d) should be
+  treated as optimistic where the fused kernel's access pattern is not purely
+  streaming.
+- **Sec. 5 and the "stop optimizing the butterfly math" conclusion are
+  unaffected**: the row kernels are still 192-218 GB/s.
+
+Projected if (c), (d) and sec. 4(a) all land on top of this: **v1 ~0.064 s,
+v2 ~0.051 s** — past the 0.070 / 0.055 endpoint sec. 3 originally projected,
+with the two largest structural pieces now banked.
+
+**Same standing caveat as every finding in this log:** measured on a
+bandwidth-constrained iGPU. The structural part (two fewer dispatches per
+iteration, ~1.4 GB less traffic, no redundant transposes anywhere in the
+frequency domain) is architecture-generic. The grid-ordering result is the
+part most specific to this hardware — it is a statement about this GPU's cache
+capacity relative to a 16.8 MB operand, and the right ordering on a part with
+a 50 MB L2 could differ.
+
+# Session: sec. 4(a) tried and rejected; sec. 3(c) implemented — final elementwise multiply fused into the width inverse FFT's store
+
+Brief: the previous session's closing notes named sec. 4(a) (rocFFT's
+`TILE=64` / block `(64,16)` / 4-elements-per-thread transpose) the top
+remaining item — "the last idea in this log with a large payoff that does not
+require restructuring the pipeline" — worth ~8 ms on v1 and ~5 ms on v2. It
+was implemented, measured across the whole tile/block space, and **rejected:
+it is a loss on this GPU at every configuration.** Sec. 3(c) was implemented
+instead and is now the largest banked win left. Hardware unchanged: AMD
+gfx1151 (Radeon 8060S / Ryzen AI MAX+ PRO 395, 40 CU, wave32, LPDDR5X unified
+memory, ~232 GB/s achievable).
+
+## Result
+
+| | before | after | speedup |
+|---|---|---|---|
+| v1 | 0.0793 s | **0.0722 s** | **1.10x** |
+| v2 | 0.0683 s | **0.0628 s** | **1.09x** |
+
+Both baselines were re-measured on this machine before touching anything
+(0.07927 / 0.06825) and agree with the previous session's recorded 0.0798 /
+0.0686. 20 iterations per measurement. Correctness is unchanged and exact:
+`test_openflr_gpu` reports the same `max|diff| = 8.940697e-08` as before, and
+`verify_correctness.py` at full scale (41, 2048, 2048) reports
+`max abs diff = 8.583e-06, max rel diff = 6.760e-07` against the numpy
+reference for both versions — identical to the pre-change values, as expected
+for a change that only moves where a load and a store happen.
+
+Cumulative from the start of the rocFFT-guided investigation: v1 0.1197 ->
+0.0722 (**1.66x**), v2 0.0900 -> 0.0628 (**1.43x**).
+
+## Part 1: sec. 4(a) is wrong for this GPU — a negative result worth recording
+
+The claim in sec. 4(a) was that our transposes sit at 145-162 GB/s (vs
+192-226 for every other kernel) because each thread moves only 8 bytes per
+phase and therefore "spends its time on index arithmetic and one round of
+load latency it can't hide", and that rocFFT's 4-elements-per-thread shape
+would fix it.
+
+**Implemented in full**, as `TROWS` elements per thread with block
+`(TILE, TILE/TROWS)`, `comptime for`-unrolled read and write loops, and a
+fast path for interior tiles so the unrolled global loads issue back to back
+with no branch between them. Two details differ from sec. 4(a)'s sketch and
+both are improvements on it:
+
+- **An XOR swizzle (`tile[r, c ^ r]`) instead of `TILE+1` column padding.**
+  Both fix the same bank conflict, but at `TILE=64` the padded tile costs
+  `2 * 64 * 65 * 4 = 33.3 KB` of LDS — over half this GPU's 64 KB per-CU
+  budget, so only one 1024-thread block would be resident where two fit
+  today. Unpadded, `re` and `im` together are exactly 32 KB and occupancy is
+  unchanged. (Sec. 4(a) flagged the LDS problem and left it open; this is the
+  answer.) The swizzle is conflict-free in both phases — `c ^ r` is a
+  bijection over a row, so write lanes (consecutive `tx`, one `r`) hit
+  distinct banks, and read lanes (row `tx`, column `c ^ tx`) have bank index
+  `(tx * TILE + (c ^ tx)) % 32 = (c ^ tx) % 32`, also distinct.
+- Applied to all three transpose variants, so the tile shape is one constant.
+
+Measured, v1, 15 iterations per point:
+
+| | TROWS=1 | TROWS=2 | TROWS=4 | TROWS=8 | TROWS=16 |
+|---|---|---|---|---|---|
+| **TILE=32** | 0.0796 | 0.0793 | 0.0794 | 0.0800 | — |
+| **TILE=64** | — | n/a | 0.0863 | 0.0842 | 0.0833 |
+
+(The two "n/a"s are configurations whose block would exceed the 1024-thread
+limit: `TILE=64, TROWS=2` is `(64,32)` and every `TILE=128` point is at least
+`(128,16)`. Baseline for reference: 0.0793.)
+
+Two things fall out, and they are more informative than the win would have
+been:
+
+1. **Elements-per-thread does nothing.** At `TILE=32`, going from 1 to 2 to 4
+   elements per thread — i.e. from 256 to 1024 threads' worth of work per
+   thread and 1 to 4 independent loads in flight — moves the total by less
+   than the 0.0006-0.0008 s run-to-run std. **The transposes are not
+   latency-limited, so the memory-level-parallelism diagnosis in sec. 4(a) is
+   simply wrong for this GPU.** Every conclusion in this log that rests on
+   "more work per thread is why the row kernels are faster than the
+   transposes" should be treated as retracted.
+2. **A bigger tile is actively worse, by 5-9%,** monotonically improving as
+   the block gets *smaller* within `TILE=64` (16 elems/thread, 256 threads,
+   beats 4 elems/thread, 1024 threads) but never recovering `TILE=32`. The
+   destination footprint is the difference: a `TILE=64` block writes 64 rows
+   of 256 B spread over 64 * 8 KB = 512 KB of destination, twice `TILE=32`'s.
+   The transposes are limited by *how much address space a block touches at
+   once* — open DRAM pages / channel spread — not by per-thread work.
+
+That reframes what is left. **The remaining transposes' 145-155 GB/s is a
+partition-camping residue, not a latency problem**, and the specific residue
+the diagonal remap does not address is *intra-block*: the remap decorrelates
+consecutively-scheduled blocks from each other, but the 32 destination rows
+*within* one block are still exactly 8192 B apart (`H * 4`, a power of two),
+so they can all land on the same channel. That points at sec. 4(c)
+(**row-pitch padding**, which rocFFT applies to strides and which this log has
+never actually tried — the earlier reverted experiment padded a *length* on
+the non-power-of-two axis, a different change) as the right next idea for the
+transposes, and demotes sec. 4(b) (AoS interleaving), whose stated benefit was
+instruction count.
+
+The change was reverted in full; `transpose_kernel`,
+`transpose_kernel_cmul` and `transpose_kernel_cmul_broadcast` are byte-identical
+to their previous form and `TILE` is back to 32.
+
+## Part 2: sec. 3(c) implemented
+
+`shift_mul_kernel` (v1) and `elementwise_mul_kernel` (v2) each read back a
+full `(D, H, W)` buffer that the immediately preceding `irfft_row_kernel` had
+just written, only to multiply it by `data_buf`. But `irfft_row_kernel`
+already holds the finished row in shared memory at the moment it stores it, so
+that whole round trip existed for nothing.
+
+`irfft_row_mul_kernel` does the store instead: it reads the corresponding row
+of `data_buf`, multiplies, and writes the product. The `(D, H, W)`
+backprojection buffer is never written and never read — 1377 MB of traffic per
+iteration removed, one dispatch removed, and `OpenFlrScratch.back` (688 MB of
+device memory, which matters on a unified-memory part) deleted outright.
+
+**v1's fftshift comes along free.** fftshift over the last two axes is a pure
+index rotation and is its own inverse for even `H`/`W`, so rotating the
+*destination* index is equivalent and keeps everything coalesced: the row
+rotation picks a different destination row (`(rr + H/2) % H`) and the column
+rotation turns each block's contiguous run of columns into two contiguous
+half-row segments. Both the `data_buf` read and the `out_buf` store stay fully
+coalesced, and the `SHIFT` flag is a comptime parameter, so v2 pays nothing
+for code it does not use.
+
+### What was built
+
+- **`irfft_row_into_lds`** (`fft_gpu.mojo`) — the body of the row-wise real
+  inverse FFT, extracted verbatim from `irfft_row_kernel`: reads a row of the
+  `(num_rows, N/2+1)` half spectrum and leaves the unscaled length-`N` real
+  result in shared memory. Everything after it is a store, and the store is
+  the only thing the callers disagree about. This keeps the radix-4 stage
+  schedule and its warp-shuffle head in exactly one place — the same
+  factoring `fft_warp_head` / `fft_lds_stages` already established for the
+  forward direction.
+- **`irfft_row_kernel`** — now `irfft_row_into_lds` plus the original scaled
+  store. Behaviour unchanged; `test_fft_gpu` and `test_fft_gpu_radix4` pass
+  with identical error figures.
+- **`irfft_row_mul_kernel[N, SHIFT, H, ...]`** — `irfft_row_into_lds` plus the
+  fused store: `out = mul * irfft(in)`, or `out = mul * fftshift(irfft(in))`
+  when `SHIFT`.
+- **`irfft2_batched_gpu_cmul_broadcast_t` -> `..._cmul_broadcast_mul_t`**,
+  gaining a `SHIFT` parameter and a `mul_buf` argument. Both of the function's
+  call sites — the tails of `run_v1_step_gpu` and `run_v2_step_gpu` — wanted
+  the trailing multiply, so this is a change to the existing function rather
+  than a variant beside it. It now computes the entire tail of a
+  Richardson-Lucy update, `data * [fftshift](irfft2(err_fft * psft_fft))`, in
+  three dispatches where the pre-3(b) code took five.
+- **Deleted**: `shift_mul_kernel`, `elementwise_mul_kernel`,
+  `OpenFlrScratch.back`, and the now-unused `thread_idx` / `block_idx` imports
+  in `openflr_gpu.mojo`.
+
+## Measured per-kernel breakdown after the change (rocprofv3, mean of two steady-state iterations)
+
+### v1 — 74.2 ms total, 12 dispatches (was 81.7 ms, 13 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6515 | 1377 | 211 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 9077 | 1377 | 152 |
+| 3 | `fft_row_cmul_ifft_kernel` | 11708 | 2066 | 176 |
+| 4 | `transpose_kernel` (W2,H)->(H,W2) | 9428 | 1377 | 146 |
+| 5 | `irfft_row_kernel` (W) | 6448 | 1377 | 214 |
+| 6 | `sum_over_depth_real_kernel` | 3352 | 705 | 210 |
+| 7-9 | `rfft2_batched_gpu_div_t` (3 kernels, (1,H,W)) | 438 | 118 | — |
+| 10 | `ifft_row_cmul_broadcast_kernel` | 8625 | 1394 | 162 |
+| 11 | `transpose_kernel` | 9437 | 1377 | 146 |
+| 12 | **`irfft_row_mul_kernel`** | **9200** | **2064** | **224** |
+| | **total** | **74228** | **13232** | **178** |
+
+### v2 — 63.1 ms total, 14 dispatches (was 69.0 ms, 15 dispatches)
+
+| # | kernel | µs | MB | GB/s |
+|---|---|---|---|---|
+| 1 | `rfft_row_kernel` (W) | 6407 | 1377 | 215 |
+| 2 | `transpose_kernel` (H,W2)->(W2,H) | 8993 | 1377 | 153 |
+| 3 | `fft_row_kernel` (H, fwd) | 7019 | 1377 | 196 |
+| 4 | `complex_mul_kernel` | 9707 | 2066 | 213 |
+| 5 | `sum_over_depth_kernel` | 3211 | 705 | 220 |
+| 6-8 | `irfft2_batched_gpu_t` (3 kernels) | 439 | 118 | — |
+| 9-11 | `rfft2_batched_gpu_div_t` (3 kernels) | 546 | 118 | — |
+| 12 | `ifft_row_cmul_broadcast_kernel` | 8146 | 1394 | 171 |
+| 13 | `transpose_kernel` | 9475 | 1377 | 145 |
+| 14 | **`irfft_row_mul_kernel`** | **9179** | **2064** | **225** |
+| | **total** | **63122** | **11973** | **190** |
+
+Dispatches 12+13 of the old v1 table (`irfft_row_kernel` 6710 +
+`shift_mul_kernel` 10596 = 17.3 ms, 3441 MB) are now the single 9.2 ms,
+2064 MB kernel on row 12 — **saving 8.1 ms**, against the 7.9 ms sec. 3(c)
+projected. v2's 14+15 (6464 + 9133 = 15.6 ms) become 9.2 ms, **saving
+6.4 ms** against a projected 6.2 ms. The new kernel runs at **224-225 GB/s,
+97% of this GPU's measured achievable bandwidth** — the fastest kernel in
+either pipeline, and above the ~220 GB/s sec. 3(c) assumed despite the
+previous session's warning that that figure might be optimistic. The fftshift
+rotation costs nothing measurable: v1's and v2's copies of the kernel are
+within 0.2% of each other.
+
+Traffic: 14.61 -> 13.23 GB (v1) and 13.35 -> 11.97 GB (v2), -9.4% and -10.3%.
+Note that the pipeline's *achieved* bandwidth is essentially unchanged
+(183 -> 183 GB/s in v1, 195 -> 191 GB/s in v2): the pair of kernels this
+replaced was already running at 199 GB/s, so **the entire win is bytes not
+moved, not a faster kernel** — which is exactly what sec. 0 predicted would be
+the only lever with a large payoff.
+
+## What is left
+
+- **The plain transposes are now 29-38% of the remaining runtime** — 27.9 ms
+  of v1's 74.2 (three dispatches) and 18.5 ms of v2's 63.1 (two) — at
+  145-153 GB/s. Part 1 rules out the micro-optimization this log had queued
+  for them and re-points at **sec. 4(c) row-pitch padding** (pad the `(D, W2,
+  H)` intermediate's row stride from `H = 2048` to `H + 64 = 2112` floats,
+  which the layouts here can express by declaring the buffer `row_major[D, W2,
+  H + 64]` and having every kernel touch only the first `H` columns) as the
+  one untried idea aimed at the actual mechanism. Per rocFFT this is an
+  **alternative to** the diagonal remap, not a complement — A/B it, do not
+  stack it. Upside if it lands cleanly is the same ~1.4x on those kernels the
+  transpose band suggests: ~8 ms (v1), ~5 ms (v2).
+- **(d) — fuse the complex multiply into `sum_over_depth_kernel` (v2 only) —
+  is unchanged and is now the largest remaining fusion.** Dispatches 4+5 are
+  12.9 ms moving 2771 MB; one kernel moving ~1394 MB at the 224 GB/s row 14
+  just demonstrated is ~6.2 ms, **saving ~6.7 ms (11% of v2)**. Row 14 is
+  direct evidence that a fused kernel here can hit that rate, so this estimate
+  is no longer optimistic. Still no atomics needed — see sec. 3(d).
+- **`ifft_row_cmul_broadcast_kernel` remains the slowest large kernel**
+  (162 GB/s v1, 171 GB/s v2) for the grid-ordering reason sec. 3(b) diagnosed.
+  The "middle ordering" idea there (keep `d` fast in groups while walking `w`
+  locally) is still cheap and untried, worth maybe ~1.5 ms.
+- **`fft_row_cmul_ifft_kernel` at 176 GB/s** is the other kernel below the
+  band, and unlike the transposes it genuinely does the most work per thread
+  in the pipeline — it is the closest thing here to a compute-limited kernel,
+  so sec. 5's barrier-count ideas apply to it if anything does.
+
+Projected if (d) and sec. 4(c) both land: v1 ~0.064 s, v2 ~0.049 s.
+
+**Same standing caveat as every finding in this log:** measured on a
+bandwidth-constrained iGPU. Sec. 3(c) is architecture-generic — it removes a
+full-size write and its matching read on any hardware, and the arithmetic is
+bit-identical. Part 1's negative result is the opposite: it is a statement
+about this GPU's DRAM organization and cache capacity, and rocFFT's tile shape
+may well be right on the parts rocFFT is tuned for. Anyone porting this to
+H100 should re-run the sweep rather than inherit the `TILE=32` conclusion.
