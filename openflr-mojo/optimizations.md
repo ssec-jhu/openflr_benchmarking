@@ -1933,23 +1933,93 @@ N=2048 on any 32-wide-warp GPU the warp-shuffle path is always the one
 taken, so those edits are unexercised. They are dead at production sizes;
 the risk is a compile error on a wave64 device, not a silent wrong answer.
 
-## 4. Measured: neutral on gfx1151, untested on A100
+## 4. Measured: neutral on gfx1151, and a clear loss on the A100 — sec. 1 is wrong
+
+gfx1151 (Radeon 8060S):
 
 | | table off | table on | delta |
 |---|---|---|---|
 | v1 | 0.07298 s | 0.07268 s | −0.4% |
 | v2 | 0.06225 s | 0.06191 s | −0.6% |
 
-Neutral, as sec. 1 predicts it must be: on this GPU the kernels the table
-touches are already at 85–93% of achievable bandwidth, so deleting
-arithmetic behind a memory stall buys nothing. Worth noting it does not
-*lose* here either, unlike both earlier attempts — the skew and the free
-LDS at these block sizes are the difference.
+A100-SXM4-80GB, 20 iterations, both arms in one process:
 
-**The A100 is the test, and it has not been run.** If sec. 1's estimate is
-right, the four FFT-bearing dispatches should give up most of ~1.9 ms each
-of transcendental time. If the table measures neutral there too, the
-estimate is wrong and the 1.9–2.8x scaling deficit is something other than
-transcendental throughput — which is itself the more valuable finding,
-because it would redirect at the barrier/latency structure of the row
-schedule rather than its arithmetic.
+| | table off | table on | delta |
+|---|---|---|---|
+| v1 | 0.019012 s | 0.021161 s | **+11.3%** |
+| v2 | 0.015154 s | 0.016142 s | **+6.5%** |
+
+Neutral on gfx1151, as expected there — those kernels sit at 85–93% of
+achievable bandwidth, so deleting arithmetic hiding behind a memory stall
+buys nothing. But **the A100 got slower**, which refutes sec. 1: the
+per-thread transcendentals are not what these kernels are waiting on.
+
+Sec. 1's instruction estimate assumed ~40 instructions per `std.math`
+Float32 `cos`/`sin`. On NVIDIA these lower to a short SFU sequence — a
+`MUFU` plus range reduction, closer to 5 instructions — so the real
+transcendental cost is nearer 0.2 ms than 1.9 ms per dispatch, and the
+estimate was roughly 8x too high. The table cannot recover time that was
+never being spent, and it charges for what it adds: one more `barrier()`
+per kernel, and an LDS load on the dependency path where there used to be
+a register-resident computation.
+
+## 5. What the A/B actually points at: these kernels are latency-bound
+
+That last point is the useful one. In a *throughput*-bound kernel, trading
+arithmetic for a cached load is roughly free. In a *latency*-bound one it
+lengthens the dependency chain and directly costs time — which is what the
+A100 measured. The trace supports that reading independently. Ordering
+every v2 dispatch by how much resident parallelism it has to hide stalls
+with:
+
+| kernel | thr/block | blocks/SM | `barrier()`s | A100 GB/s |
+|---|---|---|---|---|
+| `complex_mul_kernel` | 256 | 8 | 0 | 1778 |
+| `sum_over_depth_kernel` | 256 | 8 | 0 | 1569 |
+| `transpose_kernel` | 1024 | 2 | 1 | 1259–1349 |
+| `rfft_row_kernel` | 512 | 4 | 3 | 600 |
+| `irfft_row_mul_kernel` | 512 | 4 | 3 | 556 |
+| `fft_row_kernel` | 1024 | 2 | 4 | 453 |
+| `ifft_row_cmul_broadcast` | 1024 | 2 | 4 | 319 |
+
+(blocks/SM is the A100 thread ceiling, 2048/threads; registers and shared
+memory are not the binding limit for any of these — see sec. 0.)
+
+The two 512-thread row kernels beat both 1024-thread row kernels despite
+running the same kind of stage schedule. The transposes hold 1259+ GB/s at
+only 2 blocks/SM because with one barrier and pure streaming loads the
+memory pipeline never drains. The pattern is **not** occupancy in the
+achieved-occupancy sense — it is how many independent blocks an SM has to
+run while one of them is stalled at a barrier.
+
+**The concrete lead this gives.** `fft_lds_stages` sets
+`num_tasks = N // 4` and gates the whole body on `if tid < num_tasks`, but
+the row kernels launch `N // 2` threads. So during *every* fused radix-4
+stage — most of the schedule at N=2048 — **half the block is idle, while
+still counting against the per-SM thread ceiling and still having to reach
+every barrier.** Launching these kernels with `N // 4` threads instead
+would put 4 blocks on an SM rather than 2, at identical shared memory, and
+retire the idle warps. `fft_warp_head` and the opening gather/closing store
+would each have to handle 4 elements per thread instead of 2; the head is
+independent per 64-element block, so that is calling it twice with
+different position bases rather than new index algebra.
+
+Untested. Given sec. 1 was a confident wrong guess, the next step is to
+confirm the mechanism before restructuring — `ncu --section WarpStateStats`
+on one dispatch distinguishes `stall_barrier` from `stall_long_scoreboard`
+(DRAM latency) and `stall_short_scoreboard` (LDS latency) directly, and
+says which of these it is.
+
+## 6. Note on the `TW` flag
+
+Left in the tree, defaulted `False`. `TW=False` is bit-identical to the
+pre-flag code (sec. 3), so it costs nothing to carry, and the refactor
+folded 34 duplicated inline `cos`/`sin` sites into one `twiddle[N, L, TW,
+invert]` helper. `main.mojo` takes an `off`/`on` argument to run a single
+arm, which is what a profiler wants — both arms dispatch same-named kernels
+that differ only in their name hash.
+
+The negative result is specific to hardware with cheap transcendentals
+relative to memory latency. It would be worth re-flipping on a GPU whose
+`cos`/`sin` are not single-instruction, which is the case the two earlier
+attempts in this log and this one all failed to find.

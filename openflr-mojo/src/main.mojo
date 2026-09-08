@@ -140,6 +140,7 @@ def main() raises:
     var n_iters = 20
     var dump_path = ""
     var dump_tw = False
+    var arm = "both"
     var i = 1
     while i < len(args):
         var a = String(args[i])
@@ -152,6 +153,8 @@ def main() raises:
             dump_path = String(args[i])
         elif a == "--tw":
             dump_tw = True
+        elif a == "off" or a == "on":
+            arm = a
         else:
             n_iters = Int(a)
         i += 1
@@ -206,28 +209,18 @@ def main() raises:
         print("wrote", dump_path)
         return
 
-    # Benchmark both twiddle strategies in one invocation: `TW=False` is the
-    # inline per-thread `cos`/`sin` the kernels have always used, `TW=True`
-    # the shared twiddle table. Same process, same clocks, same warmed-up
-    # data, so the two numbers are directly comparable -- and the whole A/B
-    # costs one batch job on a cluster where interactive tuning is not an
-    # option.
+    # Benchmark the twiddle strategies: `TW=False` is the inline per-thread
+    # `cos`/`sin` the kernels have always used, `TW=True` the shared twiddle
+    # table. Both by default, in one process on one set of clocks, so the two
+    # numbers are directly comparable and the A/B costs one batch job on a
+    # cluster with no interactive access. Pass `off` or `on` to run a single
+    # arm -- which is what a profiler wants, since both arms dispatch
+    # same-named kernels and only their name hashes differ.
     comptime for tw_i in range(2):
         comptime TW = tw_i == 1
+        comptime arm_name = "on" if TW else "off"
 
-        if version == "v1":
-            run_v1_step_gpu[D, H, W, TILE, TW](
-                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
-            )
-        else:
-            run_v2_step_gpu[D, H, W, TILE, TW](
-                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
-            )
-        ctx.synchronize()
-
-        var times: List[Float64] = []
-        for _ in range(n_iters):
-            var start = perf_counter_ns()
+        if arm == "both" or arm == arm_name:
             if version == "v1":
                 run_v1_step_gpu[D, H, W, TILE, TW](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
@@ -237,17 +230,30 @@ def main() raises:
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                 )
             ctx.synchronize()
-            var elapsed = Float64(perf_counter_ns() - start) / 1.0e9
-            times.append(elapsed)
-            var tmp = data_buf
-            data_buf = out_buf
-            out_buf = tmp
 
-        var label = "on " if TW else "off"
-        var stats = mean_std(times^, n_iters)
-        print(
-            "backend: mojo, version:", version, ", twiddle table:", label,
-            ", mean time:", stats[0], "s, std time:", stats[1], "s",
-            file=stderr,
-        )
-        print("twiddle_table=" + label, stats[0], "\\pm", stats[1])
+            var times: List[Float64] = []
+            for _ in range(n_iters):
+                var start = perf_counter_ns()
+                if version == "v1":
+                    run_v1_step_gpu[D, H, W, TILE, TW](
+                        ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+                    )
+                else:
+                    run_v2_step_gpu[D, H, W, TILE, TW](
+                        ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+                    )
+                ctx.synchronize()
+                var elapsed = Float64(perf_counter_ns() - start) / 1.0e9
+                times.append(elapsed)
+                var tmp = data_buf
+                data_buf = out_buf
+                out_buf = tmp
+
+            var label = "on " if TW else "off"
+            var stats = mean_std(times^, n_iters)
+            print(
+                "backend: mojo, version:", version, ", twiddle table:", label,
+                ", mean time:", stats[0], "s, std time:", stats[1], "s",
+                file=stderr,
+            )
+            print("twiddle_table=" + label, stats[0], "\\pm", stats[1])
