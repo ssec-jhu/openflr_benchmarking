@@ -9,11 +9,11 @@ Usage:
     mojo run main.mojo -- v2 20 t4         # one arm (what a profiler wants)
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
-Arms: `base` (TW=False, TDIV=2, WDIV=4, bit-identical to the pre-flag
-kernels), `t4` (column-FFT blocks at N/4 threads), and `t4w8`/`t4w16`, which
-add the same trade on the width-axis kernels -- whose internal transform is
-length W/2, so their N/4 is W/8 threads. All four are bit-identical: they
-only remap work across threads.
+Arms: `base` (the pre-flag kernels), `t4` (column-FFT blocks at N/4
+threads), `t4w8` (`t4` plus the same trade on the width-axis kernels) and
+`t4w8c4` (`t4w8` plus halving v1's fused forward-multiply-inverse column
+kernel, the last one still at N/2). All four are bit-identical: they only
+remap work across threads.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -156,7 +156,7 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "base" or a == "t4" or a == "t4w8" or a == "t4w16":
+        elif a == "base" or a == "t4" or a == "t4w8" or a == "t4w8c4":
             arm = a
         else:
             n_iters = Int(a)
@@ -200,14 +200,18 @@ def main() raises:
     #                             W/2 complex transform, so their
     #                             traditional one-butterfly-per-thread
     #                             config is W/4 = 512 threads and the `t4`
-    #                             analogue is W/8 = 256
-    #   t4w16  TDIV=4 WDIV=16  -- 128 threads on the width axis, past where
-    #                             the column-FFT sweep's turning point was,
-    #                             so expected worse -- carried to confirm
-    #                             the turning point rather than assume it
+    #                             analogue is W/8 = 256. Measured -1.0% on
+    #                             both versions; the current best
+    #   t4w8c4 + CDIV=4         -- `t4w8` plus 512-thread blocks on
+    #                             `fft_row_cmul_ifft_kernel`, the last
+    #                             kernel still at N/2. v1 only, so on v2
+    #                             this arm is a duplicate of `t4w8` and
+    #                             doubles as a within-run reproducibility
+    #                             control
     #
-    # `tw` (the shared twiddle table) and `t8` (256-thread column blocks)
-    # were both measured and both lost; see optimizations.md s.2 and s.5.
+    # Retired after being measured and losing: `tw` (a shared twiddle
+    # table), `t8` (256-thread column blocks) and `t4w16` (128-thread width
+    # blocks). See optimizations.md s.2, s.5 and the `w8` session.
     #
     # Naming one of `base`, `t4`, `t4w8` runs just that arm, which is what a
     # profiler wants: every arm dispatches same-named kernels differing only
@@ -241,17 +245,18 @@ def main() raises:
     comptime for arm_i in range(4):
         comptime TW = False
         comptime TDIV = 2 if arm_i == 0 else 4
-        comptime WDIV = 8 if arm_i == 2 else (16 if arm_i == 3 else 4)
+        comptime WDIV = 8 if arm_i >= 2 else 4
+        comptime CDIV = 4 if arm_i == 3 else 2
         comptime arm_name = "t4" if arm_i == 1 else (
-            "t4w8" if arm_i == 2 else ("t4w16" if arm_i == 3 else "base"))
+            "t4w8" if arm_i == 2 else ("t4w8c4" if arm_i == 3 else "base"))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
+                run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                 )
             else:
-                run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
+                run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                 )
             ctx.synchronize()
@@ -266,11 +271,11 @@ def main() raises:
             for _ in range(n_iters):
                 var start = perf_counter_ns()
                 if version == "v1":
-                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
+                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                     )
                 else:
-                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
+                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                     )
                 ctx.synchronize()

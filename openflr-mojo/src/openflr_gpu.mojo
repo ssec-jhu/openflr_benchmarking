@@ -136,7 +136,7 @@ def sum_over_depth_real_kernel[
 
 def run_v1_step_gpu[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4,
+    WDIV: Int = 4, CDIV: Int = 2,
 ](
     ctx: DeviceContext,
     mut data_buf: DeviceBuffer[DType.float32],
@@ -178,7 +178,7 @@ def run_v1_step_gpu[
         ctx, data_buf, scratch.t_re_dhw2, scratch.t_im_dhw2,
         scratch.data_fft_re, scratch.data_fft_im,
     )
-    fft_col_cmul_ifft_gpu[D, H, W, TW](
+    fft_col_cmul_ifft_gpu[D, H, W, TW, CDIV](
         ctx, scratch.t_re_dhw2, scratch.t_im_dhw2, psf_fft_re, psf_fft_im,
     )
     irfft_w_from_transposed_gpu[D, H, W, TILE, TW, WDIV](
@@ -219,7 +219,7 @@ def run_v1_step_gpu[
 
 def run_v2_step_gpu[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4,
+    WDIV: Int = 4, CDIV: Int = 2,
 ](
     ctx: DeviceContext,
     mut data_buf: DeviceBuffer[DType.float32],
@@ -234,7 +234,11 @@ def run_v2_step_gpu[
     `psf_fft_*` and `psft_fft_*` are both `rfft2_batched_gpu_t` half spectra
     of the (real) PSF in the transposed canonical layout, shape
     (D, W/2+1, H) -- see optimizations.md sec. 3(a) for the forward chain and
-    sec. 3(b) for the back-projection chain."""
+    sec. 3(b) for the back-projection chain.
+
+    `CDIV` is accepted and ignored: v2 has no fused forward-multiply-inverse
+    column kernel to size, but taking it keeps one arm tuple valid for both
+    versions in `main.mojo`."""
     comptime W2 = W // 2 + 1
     comptime HW = H * W
     comptime HW2 = H * W2
