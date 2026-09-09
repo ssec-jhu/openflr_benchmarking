@@ -1,8 +1,16 @@
 """Cross-checks the Mojo GPU implementation against the numpy reference in
-../main.py, at full scale (41, 2048, 2048).
+../main.py, at full scale (41, 2048, 2048), for every benchmark arm.
+
+Two checks per version:
+  * every arm agrees with numpy to better than 1e-3;
+  * every arm agrees with `base` **bit-exactly**. They differ only in how
+    work is mapped onto threads and blocks, never in the arithmetic or its
+    order, so any difference at all is a bug. (The retired `tw` arm was the
+    one exception -- a twiddle table is a different rounding of the same
+    quantity -- and it is gone.)
 
 Usage (from openflr-mojo/):
-    ../.venv/bin/python3 verify_correctness.py
+    pixi run verify
 """
 
 import subprocess
@@ -36,10 +44,15 @@ def numpy_reference(version: str) -> np.ndarray:
         return run_numpy_v2_step(data, img, psf_fft, psft_fft)
 
 
-def mojo_result(version: str) -> np.ndarray:
+ARMS = ("base", "t4", "t4w8", "t4w16")
+BIT_EXACT = ARMS  # every arm is a pure work-mapping change
+
+
+def mojo_result(version: str, arm: str) -> np.ndarray:
     with tempfile.NamedTemporaryFile(suffix=".bin", dir="/tmp") as f:
         subprocess.run(
-            ["pixi", "run", "mojo", "run", "src/main.mojo", "--", version, "1", "--dump", f.name],
+            ["pixi", "run", "mojo", "run", "src/main.mojo", "--",
+             version, "1", arm, "--dump", f.name],
             cwd=ROOT, check=True,
         )
         return np.fromfile(f.name, dtype=np.float32)
@@ -48,15 +61,27 @@ def mojo_result(version: str) -> np.ndarray:
 def main() -> None:
     for version in ("v1", "v2"):
         expected = numpy_reference(version).ravel()
-        actual = mojo_result(version)
-        diff = np.abs(expected - actual)
-        rel = diff / (np.abs(expected) + 1e-8)
-        print(
-            f"{version}: max abs diff = {diff.max():.3e}, "
-            f"mean abs diff = {diff.mean():.3e}, max rel diff = {rel.max():.3e}"
-        )
-        assert diff.max() < 1e-3, f"{version} mismatch too large"
-    print("OK: Mojo GPU implementation matches the numpy reference.")
+        results = {}
+        for arm in ARMS:
+            actual = mojo_result(version, arm)
+            results[arm] = actual
+            diff = np.abs(expected - actual)
+            rel = diff / (np.abs(expected) + 1e-8)
+            print(
+                f"{version} {arm:<6}: max abs diff = {diff.max():.3e}, "
+                f"mean abs diff = {diff.mean():.3e}, max rel diff = {rel.max():.3e}"
+            )
+            assert diff.max() < 1e-3, f"{version} {arm} mismatch too large"
+
+        ref = results[BIT_EXACT[0]]
+        for arm in BIT_EXACT[1:]:
+            assert np.array_equal(ref, results[arm]), (
+                f"{version}: {arm} is not bit-identical to {BIT_EXACT[0]} "
+                f"(max diff {np.abs(ref - results[arm]).max():.3e}). These arms "
+                f"remap work across threads and must not change the arithmetic."
+            )
+        print(f"{version}: {' == '.join(BIT_EXACT)} bit-identical")
+    print("OK: every arm matches the numpy reference; work-mapping arms are bit-exact.")
 
 
 if __name__ == "__main__":

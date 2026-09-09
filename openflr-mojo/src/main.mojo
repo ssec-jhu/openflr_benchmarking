@@ -9,9 +9,11 @@ Usage:
     mojo run main.mojo -- v2 20 t4         # one arm (what a profiler wants)
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
-Arms: `base` (TW=False, TDIV=2, bit-identical to the pre-flag kernels),
-`tw` (shared twiddle table), `t4`/`t8` (column-FFT blocks at N/4 and N/8
-threads, for more resident blocks per SM).
+Arms: `base` (TW=False, TDIV=2, WDIV=4, bit-identical to the pre-flag
+kernels), `t4` (column-FFT blocks at N/4 threads), and `t4w8`/`t4w16`, which
+add the same trade on the width-axis kernels -- whose internal transform is
+length W/2, so their N/4 is W/8 threads. All four are bit-identical: they
+only remap work across threads.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -154,7 +156,7 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "base" or a == "tw" or a == "t4" or a == "t8":
+        elif a == "base" or a == "t4" or a == "t4w8" or a == "t4w16":
             arm = a
         else:
             n_iters = Int(a)
@@ -185,29 +187,47 @@ def main() raises:
     var out_buf = ctx.enqueue_create_buffer[DType.float32](N)
     var scratch = OpenFlrScratch[D, H, W](ctx)
 
-    # Three configurations, benchmarked in one process on one set of clocks
+    # Four configurations, benchmarked in one process on one set of clocks
     # so the numbers are directly comparable and a whole sweep costs one
     # batch job on a cluster with no interactive access:
     #
-    #   base  TW=False TDIV=2  -- bit-identical to the pre-flag kernels
-    #   tw    TW=True  TDIV=2  -- shared twiddle table (optimizations.md s.2)
-    #   t4    TW=False TDIV=4  -- half-size blocks on the two column-FFT
-    #                             kernels: 512 threads, 3 blocks/SM
-    #   t8    TW=False TDIV=8  -- quarter-size: 256 threads. `t4` measured
-    #                             40 registers, which caps 512-thread
-    #                             blocks at 3/SM; at 256 threads the same
-    #                             40 registers allow 6 (optimizations.md
-    #                             s.5 and the register note)
+    #   base   TDIV=2 WDIV=4   -- bit-identical to the pre-flag kernels
+    #   t4     TDIV=4 WDIV=4   -- half-size blocks on the two column-FFT
+    #                             kernels: 512 threads, 3 blocks/SM. The
+    #                             previous best (optimizations.md s.5)
+    #   t4w8   TDIV=4 WDIV=8   -- `t4` plus the same trade on the four
+    #                             width-axis kernels. Those run a length-
+    #                             W/2 complex transform, so their
+    #                             traditional one-butterfly-per-thread
+    #                             config is W/4 = 512 threads and the `t4`
+    #                             analogue is W/8 = 256
+    #   t4w16  TDIV=4 WDIV=16  -- 128 threads on the width axis, past where
+    #                             the column-FFT sweep's turning point was,
+    #                             so expected worse -- carried to confirm
+    #                             the turning point rather than assume it
     #
-    # Naming one of `base`, `tw`, `t4` runs just that arm, which is what a
+    # `tw` (the shared twiddle table) and `t8` (256-thread column blocks)
+    # were both measured and both lost; see optimizations.md s.2 and s.5.
+    #
+    # Naming one of `base`, `t4`, `t4w8` runs just that arm, which is what a
     # profiler wants: every arm dispatches same-named kernels differing only
     # in their name hash. `--dump <path>` writes one step's output for
     # `verify_correctness.py` and defaults to `base` unless an arm is named.
-    # Settle the clocks before any arm is timed. Each arm already does one
-    # untimed call, but on a GPU ramping from idle that is not enough: the
-    # first arm measured would otherwise carry the ramp, and the arms run in
-    # a fixed order, so the bias lands on `base` every time.
-    for _ in range(5):
+    # Settle the clocks before any arm is timed, for a fixed wall-clock span
+    # rather than a fixed iteration count.
+    #
+    # An `nsys` trace of an earlier run caught this GPU's clocks still
+    # stepping ~1.7 s in -- the same unchanged kernel ran 18.8% faster one
+    # dispatch later. A 5-iteration warmup is 75 ms on an A100, nowhere near
+    # that, so whichever arm is timed first absorbed the ramp; the arms run
+    # in a fixed order, so that was always `base`. It showed up
+    # unmistakably: across two A100 nodes `tw`/`t4`/`t8` reproduced to
+    # within 0.2% while `base` alone moved 4.4% and carried a 7-8% standard
+    # deviation. Two seconds covers the ramp both on an A100 (~15 ms per
+    # iteration) and on a far slower iGPU (~60 ms).
+    comptime WARMUP_NS = 2_000_000_000
+    var w_start = perf_counter_ns()
+    while perf_counter_ns() - w_start < WARMUP_NS:
         if version == "v1":
             run_v1_step_gpu[D, H, W, TILE, False, 2](
                 ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
@@ -216,21 +236,22 @@ def main() raises:
             run_v2_step_gpu[D, H, W, TILE, False, 2](
                 ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
             )
-    ctx.synchronize()
+        ctx.synchronize()
 
     comptime for arm_i in range(4):
-        comptime TW = arm_i == 1
-        comptime TDIV = 8 if arm_i == 3 else (4 if arm_i == 2 else 2)
-        comptime arm_name = "tw" if arm_i == 1 else (
-            "t4" if arm_i == 2 else ("t8" if arm_i == 3 else "base"))
+        comptime TW = False
+        comptime TDIV = 2 if arm_i == 0 else 4
+        comptime WDIV = 8 if arm_i == 2 else (16 if arm_i == 3 else 4)
+        comptime arm_name = "t4" if arm_i == 1 else (
+            "t4w8" if arm_i == 2 else ("t4w16" if arm_i == 3 else "base"))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, TW, TDIV](
+                run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                 )
             else:
-                run_v2_step_gpu[D, H, W, TILE, TW, TDIV](
+                run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                 )
             ctx.synchronize()
@@ -245,11 +266,11 @@ def main() raises:
             for _ in range(n_iters):
                 var start = perf_counter_ns()
                 if version == "v1":
-                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV](
+                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                     )
                 else:
-                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV](
+                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                     )
                 ctx.synchronize()

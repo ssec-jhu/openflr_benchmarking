@@ -1,8 +1,156 @@
 # Optimization findings
 
-Investigated why the Mojo GPU implementation is slower than JAX/PyTorch.
-Tested on an AMD integrated GPU (no H100 available); absolute numbers won't
-transfer, but the methodology and the unexplained bottleneck should.
+This file is a chronological log, oldest first. **Read this section, then
+skip to the last three `# Session:` headings** -- the first two of those are
+the only ones measured on an A100, and they overturn the priority order
+everything before them ends on; the third is the change currently awaiting
+an A100 measurement. The rest is history: correct on its own terms, measured
+on an AMD gfx1151 iGPU, and pointed at a different bottleneck than the target
+hardware has.
+
+---
+
+# START HERE: state of play and what to do next
+
+## Where things stand
+
+The target is the A100-SXM4-80GB. Best configuration is the `t4` arm:
+
+| | mojo `t4` | jax | gap |
+|---|---|---|---|
+| v1 | 0.018545 s | 0.017216 s | **+7.7%** |
+| v2 | 0.013756 s | 0.011200 s | **+22.8%** |
+
+v1 began this effort 20.5% behind JAX. Published in `../results.md`. On the
+gfx1151 iGPU the same code beats ROCm JAX by 1.8x and ROCm torch by 3.9x, so
+the kernels are not weak in general -- the remaining gap is A100-specific
+tuning.
+
+## The one thing to internalise before optimising anything
+
+**The A100 and the gfx1151 iGPU are bottlenecked on different things, and
+most of this log is about the iGPU.**
+
+- On gfx1151 every kernel in the pipeline is DRAM-bandwidth-bound, running
+  at 77-93% of that GPU's 232 GB/s achievable. There, *moving fewer bytes*
+  is the only lever -- which is what the older sessions optimise for, and
+  they were right to.
+- On the A100 that is only true of the kernels with no FFT butterfly in
+  them. Those scaled 7.2-8.8x from the iGPU, matching the 8.8x bandwidth
+  ratio, and `complex_mul_kernel` hits 1778 GB/s = 87% of theoretical.
+  **The FFT-bearing kernels scaled only 1.9-2.8x** and sit at 16-29% of
+  peak bandwidth. They are latency-bound, not bandwidth-bound.
+- Concretely: a byte-count reduction that wins big on the iGPU may do
+  nothing on the A100, and vice versa. Two ideas the older sections leave
+  queued as top priority -- sec. 4(c) row-pitch padding and fusion (d) --
+  are worth ~6% combined on the A100 against the ~31% they were worth on
+  the iGPU.
+
+Corollary that has now cost two wrong guesses: **do not reason about the
+A100 from the iGPU, and do not trust an instruction-count estimate.** The
+twiddle table (sec. `tw`) was predicted to save ~1.9 ms per dispatch and
+instead cost 6-11%, because Mojo's `cos`/`sin` lower to a short SFU
+sequence on NVIDIA, not the ~40-instruction routine assumed. Measure.
+
+## How to run things
+
+```
+pixi run mojo run src/main.mojo -- v2 20        # all four arms, one process
+pixi run mojo run src/main.mojo -- v2 20 t4     # one arm (what a profiler wants)
+pixi run verify                                 # every arm vs numpy, full scale
+pixi run test                                   # unit tests
+```
+
+The four arms, selected by compile-time parameters threaded from
+`main.mojo` down to the kernels. `TDIV` sets the two column-FFT kernels'
+block size to `H/TDIV`; `WDIV` sets the four width-axis kernels' to `W/WDIV`:
+
+| arm | `TDIV` | `WDIV` | what it is |
+|---|---|---|---|
+| `base` | 2 | 4 | bit-identical to commit `9da8abd`, before any of this |
+| `t4` | 4 | 4 | 512-thread column-FFT blocks -- **best A100 result so far** |
+| `t4w8` | 4 | 8 | `t4` plus 256-thread width blocks -- **awaiting A100** |
+| `t4w16` | 4 | 16 | 128-thread width blocks -- expected past the turning point |
+
+All four are bit-identical to each other by construction and `pixi run
+verify` asserts it: they only remap work across threads. Keep that invariant
+-- it is what makes an A/B trustworthy.
+
+Two arms were retired after being measured and losing: `tw` (a shared
+twiddle table, sec. `tw`) and `t8` (256-thread *column* blocks).
+
+## What must be done, in order
+
+**0. Measure `t4w8` against `t4` on the A100.** The W-axis change (the last
+`# Session:` heading) is written, verified and bit-exact, but has only been
+run on the iGPU, where it is a null result for the reason the section above
+gives. It is the outstanding item. `pixi run mojo run src/main.mojo -- v2 20`
+prints all four arms from one process.
+
+**1. `fft_row_cmul_ifft_kernel`** -- v1's largest dispatch, still pinned at
+`N/2` and the reason v1 gained only 2.6% from `t4` against v2's 6.8%. Its
+inverse pass gathers out of the same shared buffer it then overwrites, so
+more than one head block per thread means holding all of them live across
+that barrier. A second shared buffer costs 16 KB, which at 4 blocks/SM is
+128 KB of the A100's 164 KB -- it would just fit. Untried.
+
+**2. Get `t4` to 4 blocks/SM.** It currently gets 3: registers went 31 ->
+40 because the compiler hoists both head blocks' global loads together
+despite the sequential structure, and 512 threads need <= 32 registers for
+4 blocks. There is **no `__launch_bounds__` equivalent in this Mojo
+version** (checked the compiled stdlib for `launch_bounds`, `maxntid`,
+`minnctapersm`, `max_registers`), so the only lever found so far is a
+scheduling barrier between head blocks, which costs a `barrier()` -- the
+very thing being minimised. Low priority unless something cheaper appears.
+
+**3. Re-profile.** The kernel mix has changed since the breakdown in the
+A100 session; v2's remaining 22.8% gap to JAX has not been re-attributed
+since `t4` landed.
+
+## Traps, all of them paid for
+
+- **Clock ramp.** This A100's clocks were still stepping ~1.7 s into a run
+  -- an unchanged kernel ran 18.8% faster one dispatch later. `main.mojo`
+  now warms up for a fixed 2 s of wall clock; do not reduce it to an
+  iteration count. Symptom if you break it: the *first* arm timed shows a
+  7-8% standard deviation and moves 4-5% between nodes while every other
+  arm reproduces to 0.2%.
+- **`nsys` does not lock clocks** (`ncu` does). When comparing dispatches
+  in a trace, compare *adjacent* iterations and use the unchanged kernels
+  as a control -- they should agree to ~1%. If they do not, the comparison
+  spans a clock change and is invalid.
+- **`ncu` will appear to hang** unless you constrain it hard. It needs
+  `--target-processes all` (otherwise it attaches to `pixi` and waits
+  forever for launches that never come), it needs `--launch-count` in the
+  low single digits (these grids are 42k-84k blocks and warp sampling
+  overhead scales with warp-cycles; ~33 matching launches x ~10 passes
+  runs for over half an hour), and `--set full` is hopeless because kernel
+  replay must save and restore the 1.4-2 GB each kernel writes, per pass.
+  Use `-o` for a durable report, not `--csv --log-file`.
+- **`nsys` gives you occupancy for free.** `CUPTI_ACTIVITY_KIND_KERNEL`
+  carries `registersPerThread`, `blockX` and `staticSharedMemory` per
+  dispatch, which is all three occupancy limiters -- reach for this before
+  `ncu`. Add `--stats=true` or run `nsys export --type sqlite` afterwards,
+  or you get a `.nsys-rep` nothing can read.
+- **`fft_lds_stages` needs `THREADS` to divide `N/2`.** Its fused stages
+  have `N/4` tasks and its odd stage `N/2`; both now loop
+  `ceil(tasks/THREADS)` times. Before that was fixed, `THREADS < N/4`
+  silently skipped tasks and returned wrong answers with nothing to catch
+  it.
+- **The GB/s figures throughout this log are a byte *model*** -- each
+  kernel's intended global reads plus writes -- not measured DRAM traffic.
+  It has never been validated against `dram__bytes_read`. Treat it as a
+  consistent relative measure, not ground truth.
+
+---
+
+# Session: first gfx1151 investigation
+
+Everything from here to the end is the chronological log. This first block
+predates any A100 access: it investigated why the Mojo implementation was
+slower than JAX/PyTorch on an AMD gfx1151 iGPU. Absolute numbers do not
+transfer, and neither does the conclusion about *which* resource is scarce
+-- see START HERE.
 
 ## Kept
 
@@ -2228,3 +2376,198 @@ in these kernels and its occupancy is not register-capped the way the
 A100's is. The trade `t8` makes is more resident blocks against four head
 blocks and eight elements of sequential work per thread, and only the A100
 can say which side wins there.
+
+## `t8` measured: `t4` is the sweet spot
+
+A100, both versions, four arms in one process, on a second node (ga133):
+
+| version | base | tw | **t4** | t8 |
+|---|---|---|---|---|
+| v1 | 0.019989 s | 0.021163 s | **0.018545 s** | 0.019099 s |
+| v2 | 0.015413 s | 0.016145 s | **0.013756 s** | 0.014123 s |
+
+`t8` loses to `t4` by 3.0% (v1) and 2.7% (v2), while still beating `base`.
+So **512 threads is the optimum, not 256**, and the occupancy story has a
+turning point rather than being monotone. At 256 threads each thread takes
+four head blocks, eight elements at the load and the store, two iterations
+of every fused radix-4 stage and four of the odd stage; past `t4` that
+added serial work and dependency length costs more than the extra resident
+blocks return. Since `t4` beat `t8`, any extension of this idea to other
+kernels should target `N/4`, not `N/8`.
+
+### The harness had a real flaw, now fixed
+
+`tw`, `t4` and `t8` reproduced across two A100 nodes to within 0.2%:
+
+| | base | tw | t4 |
+|---|---|---|---|
+| relative std (ga133, v2) | **7.44%** | 0.18% | 0.29% |
+| ga132 -> ga133 (v2) | **+4.41%** | -0.12% | +0.20% |
+
+`base` alone was unstable, and `base` is always the first arm timed. The
+5-iteration warmup added earlier is only ~75 ms on an A100, against the
+~1.7 s clock ramp the register-trace section documents -- so the first arm
+absorbed the ramp. `main.mojo` now warms up for a fixed **2 seconds** of
+wall clock instead of a fixed iteration count, which covers the ramp on
+both an A100 (~15 ms/iteration) and the iGPU (~60 ms). Locally that took
+`base`'s standard deviation from 4.8 ms to 0.7 ms.
+
+Because of this, the honest `t4` delta uses the *clean* `base` measurement
+from ga132 (0.014761 s, 0.41% std), not ga133's ramp-contaminated 0.015413:
+**-2.6% on v1 and -6.8% on v2.** The ga133 run would read -10.7%, which is
+inflated. `t4` itself is solid -- 0.018549/0.018545 on v1 and
+0.013730/0.013756 on v2 across the two nodes.
+
+### Standing
+
+| | mojo `t4` | jax | gap |
+|---|---|---|---|
+| v1 | 0.018545 s | 0.017216 s | +7.7% |
+| v2 | 0.013756 s | 0.011200 s | +22.8% |
+
+Recorded in `../results.md`. v1 started this work 20.5% behind JAX.
+
+### Next, in order of expected value
+
+1. **The W-axis kernels at `N/4`** -- `rfft_row_kernel`,
+   `rfft_row_kernel_div`, and `irfft_row_into_lds`'s two callers. They
+   launch `W//4 = 512` threads, which for their internal length-1024
+   complex transform is the *`N/2`* configuration, i.e. exactly where the
+   column kernels started. The `t4` analogue for them is 256 threads, and
+   at 40 registers that is 6 blocks/SM against their current 4 -- the same
+   1.5x that returned 15%. They are 6.4 ms of the 17.6 ms instrumented
+   iteration, so ~5% of v2 is plausible. The cost is that these three carry
+   inline copies of the warp head and stage schedule rather than calling
+   the shared helpers, so it is three parallel edits.
+2. **`fft_row_cmul_ifft_kernel`** (v1's largest dispatch, still pinned at
+   `N/2`). Needs the read-then-overwrite hazard in its inverse pass solved
+   -- a second shared buffer costs 16 KB, which at 4 blocks/SM is 128 KB of
+   the A100's 164 KB and would just fit.
+3. **Getting `t4` to 4 blocks/SM** by holding registers at 32. Worth
+   revisiting only if a way to stop the load hoisting appears that does not
+   cost a `barrier()`.
+
+---
+
+# Session: `w8` — the same block-size trade on the W-axis kernels
+
+Implements item 1 of the previous session's list. **Code landed, verified,
+and bit-exact; the A100 measurement has not been taken yet** -- see "What to
+run" at the end. Everything below the measurement heading is prediction, not
+result, and is marked as such.
+
+## What changed
+
+The four width-axis kernels -- `rfft_row_kernel`, `rfft_row_kernel_div`,
+`irfft_row_kernel` and `irfft_row_mul_kernel` (the last two through their
+shared body `irfft_row_into_lds`) -- each launch `W // 4` threads. Their
+internal transform is the length-`W/2` complex FFT the real-input trick
+reduces to, so `W/4 == (W/2)/2` is that transform's *traditional*
+one-butterfly-per-thread configuration: exactly the `N/2` the column
+kernels sat at before `t4`. Their `t4` analogue is `W/8`.
+
+Rather than the "three parallel edits" the previous session budgeted for,
+these kernels now **call `fft_warp_head` and `fft_lds_stages`** -- the same
+two helpers `fft_row_kernel` uses -- instead of carrying inline copies of
+the warp head and the radix-4 stage schedule. That deleted ~500 lines of
+duplicated butterfly code and made the block-size knob a single parameter
+on shared code rather than three divergent hand-edits.
+
+One thing stood in the way and is worth knowing about. The real-input
+kernels run a length-`half = N/2` transform but need the enclosing
+length-`N` twiddle table: their unpack step reads `exp(-2*pi*i*k/N)`, an
+`N`-th root, which a table built for `half` does not contain. So
+`fft_lds_stages` gained a **`TN` parameter** -- the length the *table* was
+built for, defaulting to `N` -- used only for the `TW=True` lookup index and
+for the table tensor's type. `fft_warp_head` needed nothing: it was already
+independent of the transform length (it only ever touches one warp's 64
+elements), so its `N` was always the table's `N`. With `TW=False` the
+parameter is inert, `twiddle` ignoring it entirely.
+
+Threading: a `WDIV` parameter (block size `W // WDIV`, default 4 = the old
+behaviour) runs from `main.mojo` through `run_v1_step_gpu`/`run_v2_step_gpu`
+and the `_t` pipeline wrappers to the four kernels, mirroring `TDIV`.
+
+## The arms changed
+
+`tw` and `t8` are both settled negatives and were costing an arm slot each.
+The four arms are now:
+
+| arm | `TDIV` | `WDIV` | column block | width block |
+|---|---|---|---|---|
+| `base` | 2 | 4 | 1024 | 512 |
+| `t4` | 4 | 4 | 512 | 512 |
+| `t4w8` | 4 | 8 | 512 | **256** |
+| `t4w16` | 4 | 16 | 512 | **128** |
+
+`t4w16` is past where the column sweep's turning point was and is expected
+to lose; it is carried to confirm that turning point on a length-1024
+transform rather than assume it transfers from the length-2048 one.
+
+All four are now bit-identical -- `tw` was the only arm that ever was not,
+and it is gone -- so `verify_correctness.py` asserts bit-equality across the
+whole set instead of exempting one.
+
+## Verified
+
+`pixi run test` passes. `pixi run verify` at full scale (41, 2048, 2048):
+every arm matches numpy to 8.583e-06 max abs / 6.760e-07 max rel on both v1
+and v2, and **all four arms are bit-identical to each other**. That is the
+strong check on this refactor: replacing three inline stage schedules with
+calls to the shared helpers reproduced the old kernels' output bit-for-bit,
+so the helpers really were the same arithmetic in the same association.
+
+## Measured on the gfx1151 iGPU -- which does not predict the A100
+
+| | base | t4 | t4w8 | t4w16 |
+|---|---|---|---|---|
+| v1 | **0.07225** | 0.07279 | 0.07473 | 0.08785 |
+| v2 | **0.06229** | 0.06281 | 0.06341 | 0.07047 |
+
+Read this as a null result, not a negative one. On this GPU every kernel is
+DRAM-bandwidth-bound (see START HERE), so more resident blocks buy nothing
+and the extra serial work per thread costs a little -- `t4` itself, the
+A100's current best by 2.6-6.8%, also loses here, by 0.8%. The one thing
+that does transfer is the shape: `t4w16` is 8-21% worse than `t4w8` on both
+versions and both GPUs' worth of reasoning, consistent with the turning
+point being real and `W/8` being the right target.
+
+## What to run on the A100, and how to read it
+
+```
+pixi run mojo run src/main.mojo -- v1 20
+pixi run mojo run src/main.mojo -- v2 20
+```
+
+Both print all four arms from one process on one set of clocks. The
+comparison that matters is **`t4w8` against `t4`**; `base` is there as the
+bit-identity anchor and the historical zero.
+
+Predictions, to be checked rather than believed:
+
+- `t4w8` beats `t4` by roughly 3-5% on v2. The four kernels are 6.4 ms of a
+  17.6 ms instrumented iteration and the occupancy step is 4 -> 6 blocks/SM
+  if registers hold at 40, the same 1.5x that returned 15% on the kernels
+  `t4` touched.
+- `t4w16` loses to `t4w8`.
+- If `t4w8` is *neutral*, the likely cause is registers: at 256 threads the
+  compiler may hoist the two head blocks' global loads together the way it
+  did for `t4` (31 -> 40 registers), and the win depends on the register
+  count not moving. `nsys` reports `registersPerThread` per dispatch for
+  free -- check it before reaching for `ncu` (see the traps list).
+
+## Next, in order of expected value
+
+1. **`fft_row_cmul_ifft_kernel`** -- unchanged from the previous session's
+   list. v1's largest dispatch, still pinned at `N/2`, and the reason v1
+   gained only 2.6% from `t4` against v2's 6.8%. Its inverse pass gathers
+   out of the same shared buffer it then overwrites, so more than one head
+   block per thread means holding all of them live across that barrier. A
+   second shared buffer costs 16 KB, which at 4 blocks/SM is 128 KB of the
+   A100's 164 KB -- it would just fit. Untried.
+2. **Re-profile.** The kernel mix has now changed twice since the A100
+   breakdown; the remaining gap to JAX has not been re-attributed since
+   `t4`, let alone since this.
+3. **Getting `t4` to 4 blocks/SM** by holding registers at 32. Still
+   blocked on there being no `__launch_bounds__` equivalent in this Mojo
+   version.

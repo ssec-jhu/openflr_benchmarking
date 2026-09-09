@@ -79,13 +79,30 @@ pixi run test           # CPU + GPU correctness tests, small synthetic sizes
 pixi run run-v1                       # v1, 20 iterations
 pixi run run-v2                       # v2, 20 iterations
 mojo run src/main.mojo -- v2 20       # equivalent, explicit
+mojo run src/main.mojo -- v2 20 t4    # one arm only (what a profiler wants)
 mojo run src/main.mojo -- v1 1 --dump out.bin   # single step, dump raw float32 output
+pixi run verify                       # every arm vs the numpy reference, full scale
 ```
 
-Output mirrors `../main.py`: a human-readable line on stderr, and a bare
-`mean \pm std` (seconds) line on stdout — so `make time-mojo-v1` /
-`make time-mojo-v2` from the repo root behave like the other backends'
-targets.
+Each run benchmarks four **arms** — compile-time configurations threaded
+from `main.mojo` down to the kernels — and prints one line each: `base`
+(the reference implementation), `t4` (smaller column-FFT blocks, for more
+resident blocks per SM), and `t4w8`/`t4w16` (`t4` plus the same trade on the
+width-axis kernels, at two block sizes). `t4` is the fastest measured on the
+A100 so far; `t4w8` is written and verified but not yet measured there. All
+four arms are bit-identical to each other by construction — they only remap
+work across threads — and `pixi run verify` asserts it.
+
+Output mirrors `../main.py`: a human-readable line on stderr, and an
+`arm=<name> mean \pm std` (seconds) line on stdout per arm — so
+`make time-mojo-v1` / `make time-mojo-v2` from the repo root behave like the
+other backends' targets, with one line per arm instead of one.
+
+**Before optimising anything, read the `START HERE` section at the top of
+[`optimizations.md`](optimizations.md).** It carries the current numbers, the
+ordered list of what to do next, and — most importantly — why the A100 and
+the AMD iGPU this was originally tuned on are bottlenecked on different
+resources, which invalidates a lot of otherwise-reasonable intuition.
 
 ## Known limitations / future work
 

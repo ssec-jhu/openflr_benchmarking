@@ -12,6 +12,7 @@ test-fft-gpu = "mojo run src/test_fft_gpu.mojo && mojo run src/test_fft2_gpu.moj
 test-openflr-cpu = "mojo run src/test_openflr.mojo"
 test-openflr-gpu = "mojo run src/test_openflr_gpu.mojo"
 test = { depends-on = ["test-fft-cpu", "test-fft-gpu", "test-openflr-cpu", "test-openflr-gpu"] }
+verify = { cmd = "../.venv/bin/python3 verify_correctness.py", description = "Check every benchmark arm against the numpy reference at full scale" }
 run-v1 = "mojo run src/main.mojo -- v1 20"
 run-v2 = "mojo run src/main.mojo -- v2 20"
 
