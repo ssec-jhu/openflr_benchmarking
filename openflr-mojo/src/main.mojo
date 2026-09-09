@@ -10,10 +10,9 @@ Usage:
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
 Arms: `base` (the pre-flag kernels), `t4w8` (an intermediate kept as a
-cross-run check), `t4w8c4` (the best measured configuration) and
-`t4w8c4i8`, which additionally gives `ifft_row_cmul_broadcast_kernel` its
-own block size. All four are bit-identical: they only remap work across
-threads.
+cross-run check), `t4w8c4` (the best measured configuration) and `t8w8c4`,
+which drops `fft_row_kernel` alone to 256-thread blocks. All four are
+bit-identical: they only remap work across threads.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -156,7 +155,7 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "base" or a == "t4w8" or a == "t4w8c4" or a == "t4w8c4i8":
+        elif a == "base" or a == "t4w8" or a == "t4w8c4" or a == "t8w8c4":
             arm = a
         else:
             n_iters = Int(a)
@@ -203,20 +202,21 @@ def main() raises:
     #                             -4.95% on v1; the current best. v1 only,
     #                             so on v2 it duplicates `t4w8` and doubles
     #                             as a within-run reproducibility control
-    #   t4w8c4i8 + IDIV=8       -- plus 256-thread blocks on
-    #                             `ifft_row_cmul_broadcast_kernel` alone.
-    #                             `t8` moved it and `fft_row_kernel`
-    #                             together and lost 2.7%, but those two sit
-    #                             on opposite sides of the bandwidth line
-    #                             that predicts whether a smaller block
-    #                             pays, so that result may have been a mix
-    #                             of a win and a larger loss. Affects both
+    #   t8w8c4   TDIV=8 IDIV=4  -- `t4w8c4` with `fft_row_kernel` alone
+    #                             dropped to 256 threads,
+    #                             `ifft_row_cmul_broadcast_kernel` left at
+    #                             512. The other half of the split `t8`
+    #                             conflated: `t8` moved both and lost 2.7%,
+    #                             `t4w8c4i8` moved only the broadcast one
+    #                             and lost 4.3%, which implies this
+    #                             configuration *gains* ~1.6%. Affects both
     #                             versions
     #
     # Retired after being measured and losing: `tw` (a shared twiddle
-    # table), `t8` (both column kernels at 256 threads) and `t4w16`
-    # (128-thread width blocks). See optimizations.md s.2, s.5, and the
-    # `w8` and `c4` sessions.
+    # table), `t8` (both column kernels at 256 threads), `t4w16`
+    # (128-thread width blocks) and `t4w8c4i8` (256-thread
+    # `ifft_row_cmul_broadcast_kernel`). See optimizations.md s.2, s.5, and
+    # the `w8`, `c4` and `i8` sessions.
     #
     # Naming one of `base`, `t4w8`, `t4w8c4` runs just that arm, which is what a
     # profiler wants: every arm dispatches same-named kernels differing only
@@ -249,12 +249,14 @@ def main() raises:
 
     comptime for arm_i in range(4):
         comptime TW = False
-        comptime TDIV = 2 if arm_i == 0 else 4
+        comptime TDIV = 2 if arm_i == 0 else (8 if arm_i == 3 else 4)
         comptime WDIV = 4 if arm_i == 0 else 8
         comptime CDIV = 4 if arm_i >= 2 else 2
-        comptime IDIV = 8 if arm_i == 3 else TDIV
+        # Pinned to 4 on the last arm so `TDIV` moves `fft_row_kernel` and
+        # nothing else; everywhere else it tracks `TDIV`, as it always did.
+        comptime IDIV = 4 if arm_i == 3 else TDIV
         comptime arm_name = "t4w8" if arm_i == 1 else (
-            "t4w8c4" if arm_i == 2 else ("t4w8c4i8" if arm_i == 3 else "base"))
+            "t4w8c4" if arm_i == 2 else ("t8w8c4" if arm_i == 3 else "base"))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":

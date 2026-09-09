@@ -87,8 +87,8 @@ pixi run verify                       # every arm vs the numpy reference, full s
 Each run benchmarks four **arms** — compile-time configurations threaded
 from `main.mojo` down to the kernels, each giving some group of kernels a
 different block size — and prints one line each: `base` (the reference
-implementation), `t4w8`, `t4w8c4` and `t4w8c4i8`. `t4w8c4` is the fastest
-measured on the A100; `t4w8c4i8` is written and verified but not yet
+implementation), `t4w8`, `t4w8c4` and `t8w8c4`. `t4w8c4` is the fastest
+measured on the A100; `t8w8c4` is written and verified but not yet
 measured there. All four arms are bit-identical to each other by
 construction — they only remap work across threads — and `pixi run verify`
 asserts it. See `optimizations.md` for what each knob sizes and which two
