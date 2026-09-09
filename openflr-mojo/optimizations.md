@@ -90,6 +90,95 @@ warp's load touch 32 distinct 32-byte sectors where a coalesced load touches
 4. Cheap in DRAM traffic (the 8 KB rows stay in L1, which is why the byte
 model never saw it), expensive in L1 wavefronts. See the profile session.
 
+## Does this hold on other cards? Measured on three now
+
+Same code, same arms, three GPUs. **The ranking is identical everywhere and
+the magnitudes are not.**
+
+| | gfx1151 iGPU | A100 | H100 NVL |
+|---|---|---|---|
+| `t4w8c4` vs `base` (block sizes) | **+1.8%** | -7.7% | -4.8% |
+| `t8w8c4G` vs `t4w8c4` (**the gather fix**) | -1.0% | **-32.3%** | **-26.5%** |
+| `t8w8c4G` vs `base` (everything) | +0.8% | -37.5% | -30.1% |
+| `t8w8c4Gi8` vs best (`IDIV=8` retest) | +0.3% | +4.3%* | **+9.2%** |
+| `t8w16c4G` vs best (`WDIV=16` retest) | +2.9% | +0.2%* | **+12.4%** |
+
+v2 figures; * measured pre-gather, as `t4w8c4i8` / `t4w16`.
+
+- **The gather fix transferred, and it is the whole story on NVIDIA.**
+  -26.5% on H100 against -32.3% on A100. The mechanism is architectural --
+  32-byte sectors, 32 shared-memory banks -- and it behaves that way.
+- **The block sizes transferred better than predicted.** This file
+  previously guessed they would not, on the strength of the iGPU flipping
+  their sign. On H100 they hold, at about two-thirds the A100 effect. The
+  iGPU is the outlier, not H100.
+- **Both retests are dead, everywhere, and lose *more* on newer hardware.**
+  `IDIV=8` and `WDIV=16` cost 9-12% on H100 against 0.2-4.3% on A100.
+  Settled; do not revisit.
+- **The iGPU remains the outlier** and still cannot screen candidates: it is
+  DRAM-bound at 77-93% of achievable, so there is no latency to hide and the
+  whole effort nets to +0.8% there.
+
+### Same-node H100 NVL head-to-head: the lead does not survive
+
+`make time-jax-*` on the same node, so this one is clean:
+
+| | mojo `t8w8c4G` | jax | mojo vs jax |
+|---|---|---|---|
+| A100 v1 | 0.012650 | 0.017216 | **1.36x faster** |
+| A100 v2 | 0.009218 | 0.011200 | **1.22x faster** |
+| H100 NVL v1 | 0.008488 | 0.008887 | 1.05x faster |
+| H100 NVL v2 | 0.006269 | 0.005837 | **0.93x -- 7.4% slower** |
+
+Both H100 gaps are real, not noise: 11 sigma on v1 and 8 sigma on v2 against
+the standard error of 20 iterations. **On an H100 the A100 lead is gone**,
+and on v2 it is a loss.
+
+The scaling table says exactly why:
+
+| | A100 -> H100 NVL |
+|---|---|
+| DRAM bandwidth | 1.91x |
+| **jax** v1 / v2 | **1.94x / 1.92x** |
+| **mojo** v1 / v2 | **1.49x / 1.47x** |
+
+**JAX scales at the bandwidth ratio and this implementation does not.** JAX
+(cuFFT underneath) is at the memory roof on both cards, so it collects the
+full generational gain; we collect three-quarters of it, which means
+something other than DRAM binds our kernels on H100. That is the same
+situation the A100 was in at 42% of peak before the gather fix -- a
+bottleneck that a profile can find and that has nothing to do with the ideas
+already tried here. **There is headroom on H100, and the way to it is an
+`nsys`/`ncu` pass on that card, not an extrapolation from the A100
+profile.**
+
+An incidental correction: this file previously worried that H100 NVL's lower
+power budget would make it slower than the SXM5 in `../results.md`. Wrong --
+jax runs 7.5-8.7% *faster* on the NVL, consistent with its higher bandwidth
+on a workload this memory-heavy. NVL is a fair, and slightly favourable,
+place to measure.
+
+### One measurement caveat that cuts against mojo here
+
+`t8w8c4G` is the third of five arms in a single process; `make time-jax-v2`
+is a standalone run. On this card the arm order is *not* neutral -- `base`
+and `t4w8c4` reproduce to 0.04-0.11% while `t8w8c4G` carries 3.19% relative
+standard deviation, drift that develops during the run on a ~350 W card. So
+the mojo figure is measured on a hotter card than the jax figure, and the
+7.4% v2 loss is an upper bound on the true gap rather than a point estimate.
+
+Two changes came out of this:
+
+- `main.mojo` now sweeps the arms **twice, the second pass in reverse
+  order**, printing `arm=<name> pass=<0|1>`. Every arm is measured once
+  early and once late; the positions sum to a constant, so averaging the
+  pair cancels linear drift and the spread between them measures how much
+  there was. On the iGPU the two passes agree to 0.09%.
+- **For a cross-backend comparison, name a single arm**
+  (`-- v2 20 t8w8c4G`). A five-arm sweep heats the card in a way a
+  standalone jax run does not, and that bias does not cancel between
+  processes.
+
 ## The one thing to internalise before optimising anything
 
 **The A100 and the gfx1151 iGPU are bottlenecked on different things, and

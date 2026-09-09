@@ -249,7 +249,25 @@ def main() raises:
             )
         ctx.synchronize()
 
-    comptime for arm_i in range(5):
+    # Two passes over the arms, the second in reverse order. On the A100 the
+    # only drift was a clock ramp at the very start, which the warmup above
+    # covers. On an H100 NVL it is the opposite: the first two arms
+    # reproduce to 0.04-0.11% while the third carries 3.2% -- drift that
+    # develops *during* the run (thermal or power capping on a ~350 W card),
+    # which a fixed arm order confounds with the arm itself. Sweeping twice
+    # in opposite orders is the standard counterbalance: every arm is
+    # measured once early and once late, the two positions sum to a
+    # constant, so averaging the pair cancels linear drift and the spread
+    # between them measures how much drift there was. Costs one extra second
+    # of GPU time against a compile that takes minutes.
+    #
+    # For a head-to-head against another backend, prefer naming a single arm
+    # (`-- v2 20 t8w8c4G`): a five-arm sweep heats the card in a way a
+    # standalone `make time-jax-v2` does not, and that bias does not cancel
+    # between processes.
+    comptime for pass_i in range(2):
+      comptime for slot in range(5):
+        comptime arm_i = slot if pass_i == 0 else 4 - slot
         comptime TW = False
         comptime TDIV = 2 if arm_i == 0 else (4 if arm_i == 1 else 8)
         comptime WDIV = 4 if arm_i == 0 else (16 if arm_i == 4 else 8)
@@ -301,7 +319,8 @@ def main() raises:
             var stats = mean_std(times^, n_iters)
             print(
                 "backend: mojo, version:", version, ", arm:", arm_name,
+                ", pass:", pass_i,
                 ", mean time:", stats[0], "s, std time:", stats[1], "s",
                 file=stderr,
             )
-            print("arm=" + arm_name, stats[0], "\\pm", stats[1])
+            print("arm=" + arm_name, "pass=" + String(pass_i), stats[0], "\\pm", stats[1])
