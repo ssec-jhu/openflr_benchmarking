@@ -2023,3 +2023,94 @@ The negative result is specific to hardware with cheap transcendentals
 relative to memory latency. It would be worth re-flipping on a GPU whose
 `cos`/`sin` are not single-instruction, which is the case the two earlier
 attempts in this log and this one all failed to find.
+
+# Session: `t4` — half-size blocks on the two column-FFT kernels
+
+Follow-on from the previous session's sec. 5, which read the A100 trace as
+latency-bound and pointed at the block size. Built, verified, and measured
+on gfx1151; **not yet measured on the A100**.
+
+## The observation being acted on
+
+`fft_lds_stages` runs each fused radix-4 stage over `num_tasks = N // 4`
+tasks behind an `if tid < num_tasks` guard, but the row kernels launch
+`N // 2` threads. At N=2048 that is most of the stage schedule spent with
+**half the block idle at the guard** — while those warps still occupy the
+SM's thread budget (the binding occupancy limit on A100: 2048 threads/SM
+÷ 1024 = 2 blocks) and still have to reach every `barrier()`.
+
+Launching at `N // 4` puts 4 blocks on an SM instead of 2, at identical
+shared memory, and gives every thread work in the radix-4 stages.
+
+## What was built
+
+A compile-time `THREADS` on the kernels and `TDIV` on the host functions
+(`THREADS = N // TDIV`), defaulted to the traditional `N // 2`, threaded up
+to `main.mojo` as a third benchmark arm alongside `base` and `tw`.
+
+- **`fft_row_kernel`** and **`ifft_row_cmul_broadcast_kernel`** take
+  `THREADS`. Each thread now covers `heads = (N/2)/THREADS` of the warp
+  head's 64-element blocks and `elems = N/THREADS` elements at the load and
+  the store.
+- **Head blocks are processed one at a time, in sequence**, not held
+  together. Carrying four elements at once would raise register pressure
+  and give back the occupancy this exists to win — the whole point.
+- **The head-block stride is `num_warps`, not 1.** The head-block index
+  lands in the *low* bits of the bit-reversed source address (for
+  `pos = 64b + l`, `bit_reverse(pos) = rev5(l)·64 + rev(b)`), so blocks `w`
+  and `w + num_warps` read *adjacent* addresses while `w` and `w+1` read
+  far apart. Free, and it tightens the gather.
+- **The odd stage in `fft_lds_stages`** has `N/2` tasks, so it loops
+  `N/(2*THREADS)` times. The radix-4 stages needed no change at all: their
+  existing `if tid < N//4` guard is simply always true at `THREADS = N/4`.
+- **`fft_row_cmul_ifft_kernel` is deliberately left at `N // 2`** and takes
+  no `THREADS`. Its inverse pass gathers out of the same shared buffer it
+  then overwrites, so more than one head block per thread would mean
+  holding all of them live across that barrier — the register cost works
+  against the occupancy the smaller block buys. It is v1-only; the two
+  kernels that were changed both gather from global memory. This is the
+  one scope boundary in the change.
+
+## Correctness
+
+`t4` is **bit-identical to the pre-flag code** at full scale, for both v1
+and v2 — stronger than the `tw` arm managed, and expected: the change
+remaps which thread does which work and touches neither the arithmetic nor
+its order. `base` remains bit-identical too. Full `pixi run test` passes.
+
+| arm | max abs vs numpy | vs original |
+|---|---|---|
+| `base` | 8.583e-06 | bit-identical |
+| `tw` | 8.583e-06 | differs by 2.861e-06 |
+| `t4` | 8.583e-06 | **bit-identical** |
+
+## Measured on gfx1151: neutral
+
+| version | base | tw | t4 |
+|---|---|---|---|
+| v1 | 0.08863 s | 0.08934 s | 0.08984 s |
+| v2 | 0.07138 s | 0.07147 s | 0.07097 s |
+
+All three within ~1.5%, against per-arm standard deviations of 0.7–2 ms —
+i.e. no signal. Expected: this GPU is DRAM-bound in these kernels and its
+occupancy limits are not the A100's. `main.mojo` now runs 5 untimed
+iterations before the arm loop, because the arms run in a fixed order and
+without that the clock ramp landed entirely on `base`.
+
+## The one risk to watch on the A100
+
+At 512 threads, 4 blocks/SM needs **≤ 32 registers per thread**
+(65536 / 4 / 512). The nsys trace measured `fft_row_kernel` at 31. If the
+restructuring pushes it to 33, only 3 blocks fit and most of the benefit
+evaporates. That is exactly what the sequential head-block loop is meant to
+prevent, but it is worth confirming rather than assuming — and `nsys`
+records `registersPerThread` per dispatch, so a plain kernel trace of the
+`t4` arm answers it without touching `ncu`:
+
+```
+nsys profile --trace=cuda -o t4_regs \
+    pixi run mojo run src/main.mojo -- v2 1 t4
+```
+
+then read `registersPerThread` and `blockX` out of
+`CUPTI_ACTIVITY_KIND_KERNEL` in the `.sqlite`.

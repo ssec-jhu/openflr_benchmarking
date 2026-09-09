@@ -248,7 +248,9 @@ def fft_warp_head[N: Int, invert: Bool, TW: Bool](
     b_im = new_b_im
 
 
-def fft_lds_stages[N: Int, first_stage: Int, invert: Bool, TW: Bool](
+def fft_lds_stages[
+    N: Int, first_stage: Int, invert: Bool, TW: Bool, THREADS: Int
+](
     t_re: TileTensor[
         DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
         address_space = AddressSpace.SHARED,
@@ -273,10 +275,18 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool, TW: Bool](
     Stages are run as fused radix-4 pairs: two chained radix-2 DIT stages
     rewritten algebraically as one radix-4 stage (see optimizations.md
     "Higher-radix FFT stages"), halving the `barrier()`/shared-memory round
-    trips for these large-stride stages. Only `N/4` of the `N/2` launched
-    threads do work per fused stage (each produces 4 outputs instead of 2);
-    the rest idle until the shared `barrier()`. A leftover odd stage (when
-    `log2(N) - first_stage` is odd) runs as a plain radix-2 stage afterward.
+    trips for these large-stride stages. Each fused stage has `N/4` tasks
+    and each produces 4 outputs; the leftover odd stage (when
+    `log2(N) - first_stage` is odd) is a plain radix-2 stage over `N/2`
+    tasks.
+
+    `THREADS` is the launching block's size. At the traditional `N/2` a
+    fused stage leaves half the block idle at the `if tid < num_tasks`
+    guard while it still occupies the SM's thread budget and still has to
+    reach every `barrier()`; at `N/4` every thread works and twice as many
+    blocks fit per SM. The odd stage is the mirror case -- it has `N/2`
+    tasks, so it loops `N/(2*THREADS)` times. Both degenerate to exactly
+    the old code at `THREADS == N/2`.
 
     `first_stage` is 6 when the caller ran `fft_warp_head` first and 0 when
     it did not (`N < 64`, or no 32-wide warps). Leaves the finished spectrum
@@ -350,38 +360,52 @@ def fft_lds_stages[N: Int, first_stage: Int, invert: Bool, TW: Bool](
         comptime stage = log2n - 1
         comptime size = 1 << (stage + 1)
         comptime stage_half = size // 2
-        var group = tid // stage_half
-        var k = tid % stage_half
-        var i0 = group * size + k
-        var i1 = i0 + stage_half
-        var angle_tw = twiddle[N, size, TW, invert](t_re, t_im, k)
-        var wr = angle_tw[0]
-        var wi = angle_tw[1]
-        var xr = s_re[i1]
-        var xi = s_im[i1]
-        var tr = xr * wr - xi * wi
-        var ti = xr * wi + xi * wr
-        var ur = s_re[i0]
-        var ui = s_im[i0]
-        s_re[i0] = ur + tr
-        s_im[i0] = ui + ti
-        s_re[i1] = ur - tr
-        s_im[i1] = ui - ti
+        comptime assert stage_half % THREADS == 0, "THREADS must divide N/2"
+        comptime for r in range(stage_half // THREADS):
+            var tt = tid + r * THREADS
+            var group = tt // stage_half
+            var k = tt % stage_half
+            var i0 = group * size + k
+            var i1 = i0 + stage_half
+            var angle_tw = twiddle[N, size, TW, invert](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
+            var xr = s_re[i1]
+            var xi = s_im[i1]
+            var tr = xr * wr - xi * wi
+            var ti = xr * wi + xi * wr
+            var ur = s_re[i0]
+            var ui = s_im[i0]
+            s_re[i0] = ur + tr
+            s_im[i0] = ui + ti
+            s_re[i1] = ur - tr
+            s_im[i1] = ui - ti
         barrier()
 
 
 def fft_row_kernel[
-    N: Int, LT: TensorLayout, invert: Bool, TW: Bool = False
+    N: Int, LT: TensorLayout, invert: Bool, TW: Bool = False, THREADS: Int = N // 2
 ](
     re: TileTensor[DType.float32, LT, MutAnyOrigin],
     im: TileTensor[DType.float32, LT, MutAnyOrigin],
 ):
     """`re`/`im` have shape (num_rows, N); grid.x == num_rows,
-    block.x == N // 2."""
+    block.x == THREADS.
+
+    `THREADS` defaults to the traditional `N // 2` -- one butterfly per
+    thread in the warp head, two elements loaded and stored per thread.
+    Halving it to `N // 4` gives each thread two of the head's 64-element
+    blocks and four elements at the load and the store, which doubles the
+    blocks resident per SM (these blocks are capped by the SM's thread
+    budget, not by registers or shared memory) without changing the shared
+    memory footprint. See optimizations.md sec. 5."""
     comptime assert re.flat_rank == 2, "expected (rows, N) tensor"
     comptime assert im.flat_rank == 2, "expected (rows, N) tensor"
     comptime log2n = ilog2_ct(N)
     comptime half = N // 2
+    comptime heads = half // THREADS       # 64-element head blocks per thread
+    comptime elems = N // THREADS          # elements loaded/stored per thread
+    comptime assert half % THREADS == 0, "THREADS must divide N/2"
 
     var row = block_idx.x
     var tid = thread_idx.x
@@ -391,52 +415,61 @@ def fft_row_kernel[
 
     var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
-    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 2)
+    fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
     comptime if N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
-        var pos_a = 64 * warp + lane
-        var pos_b = pos_a + 32
-        var src_a = bit_reverse_ct(pos_a, log2n)
-        var src_b = bit_reverse_ct(pos_b, log2n)
-        var a_re = rebind[Scalar[DType.float32]](re[row, src_a])
-        var a_im = rebind[Scalar[DType.float32]](im[row, src_a])
-        var b_re = rebind[Scalar[DType.float32]](re[row, src_b])
-        var b_im = rebind[Scalar[DType.float32]](im[row, src_b])
+        # One head block at a time rather than all `heads` at once, so the
+        # live register set is the same as at THREADS == N/2; carrying four
+        # elements simultaneously would raise register pressure and give
+        # back the occupancy this is here to win. Striding by `num_warps`
+        # rather than taking consecutive blocks also keeps the gather tight:
+        # the head-block index lands in the *low* bits of the bit-reversed
+        # source, so blocks `w` and `w + num_warps` read adjacent addresses.
+        comptime num_warps = THREADS // 32
+        comptime for h in range(heads):
+            var blk = warp + h * num_warps
+            var pos_a = 64 * blk + lane
+            var pos_b = pos_a + 32
+            var src_a = bit_reverse_ct(pos_a, log2n)
+            var src_b = bit_reverse_ct(pos_b, log2n)
+            var a_re = rebind[Scalar[DType.float32]](re[row, src_a])
+            var a_im = rebind[Scalar[DType.float32]](im[row, src_a])
+            var b_re = rebind[Scalar[DType.float32]](re[row, src_b])
+            var b_im = rebind[Scalar[DType.float32]](im[row, src_b])
 
-        fft_warp_head[N, invert, TW](t_re, t_im, a_re, a_im, b_re, b_im, lane)
+            fft_warp_head[N, invert, TW](t_re, t_im, a_re, a_im, b_re, b_im, lane)
 
-        s_re[pos_a] = a_re
-        s_im[pos_a] = a_im
-        s_re[pos_b] = b_re
-        s_im[pos_b] = b_im
+            s_re[pos_a] = a_re
+            s_im[pos_a] = a_im
+            s_re[pos_b] = b_re
+            s_im[pos_b] = b_im
         barrier()
 
-        fft_lds_stages[N, 6, invert, TW](t_re, t_im, s_re, s_im, tid)
+        fft_lds_stages[N, 6, invert, TW, THREADS](t_re, t_im, s_re, s_im, tid)
     else:
-        # Bit-reversed load: thread `tid` fills slots `tid` and `tid + half`.
-        var src0 = bit_reverse_ct(tid, log2n)
-        var src1 = bit_reverse_ct(tid + half, log2n)
-        s_re[tid] = rebind[Scalar[DType.float32]](re[row, src0])
-        s_im[tid] = rebind[Scalar[DType.float32]](im[row, src0])
-        s_re[tid + half] = rebind[Scalar[DType.float32]](re[row, src1])
-        s_im[tid + half] = rebind[Scalar[DType.float32]](im[row, src1])
+        # Bit-reversed load: thread `tid` fills slots `tid + e*THREADS`.
+        comptime for e in range(elems):
+            var dst = tid + e * THREADS
+            var src = bit_reverse_ct(dst, log2n)
+            s_re[dst] = rebind[Scalar[DType.float32]](re[row, src])
+            s_im[dst] = rebind[Scalar[DType.float32]](im[row, src])
         barrier()
 
-        fft_lds_stages[N, 0, invert, TW](t_re, t_im, s_re, s_im, tid)
+        fft_lds_stages[N, 0, invert, TW, THREADS](t_re, t_im, s_re, s_im, tid)
 
     comptime if invert:
         comptime inv_n: Float32 = 1.0 / Float32(N)
-        re[row, tid] = rebind[re.ElementType](s_re[tid] * inv_n)
-        im[row, tid] = rebind[im.ElementType](s_im[tid] * inv_n)
-        re[row, tid + half] = rebind[re.ElementType](s_re[tid + half] * inv_n)
-        im[row, tid + half] = rebind[im.ElementType](s_im[tid + half] * inv_n)
+        comptime for e in range(elems):
+            var o = tid + e * THREADS
+            re[row, o] = rebind[re.ElementType](s_re[o] * inv_n)
+            im[row, o] = rebind[im.ElementType](s_im[o] * inv_n)
     else:
-        re[row, tid] = rebind[re.ElementType](s_re[tid])
-        im[row, tid] = rebind[im.ElementType](s_im[tid])
-        re[row, tid + half] = rebind[re.ElementType](s_re[tid + half])
-        im[row, tid + half] = rebind[im.ElementType](s_im[tid + half])
+        comptime for e in range(elems):
+            var o = tid + e * THREADS
+            re[row, o] = rebind[re.ElementType](s_re[o])
+            im[row, o] = rebind[im.ElementType](s_im[o])
 
 
 def lds_swizzle(i: Int) -> Int:
@@ -486,7 +519,16 @@ def fft_row_cmul_ifft_kernel[
     forward pass, shared memory for the inverse) and what happens at the end
     (the multiply for the forward pass, the scaled global store for the
     inverse). Everything between is the identical stage schedule as
-    `fft_row_kernel` -- `fft_warp_head` then `fft_lds_stages`."""
+    `fft_row_kernel` -- `fft_warp_head` then `fft_lds_stages`.
+
+    Unlike `fft_row_kernel` and `ifft_row_cmul_broadcast_kernel` this one is
+    pinned to `block.x == N // 2` and takes no `THREADS` parameter: its
+    inverse pass gathers out of the very shared buffer it then overwrites,
+    so giving each thread more than one head block would mean holding all
+    of them live across that barrier. Those extra registers work against
+    the occupancy a smaller block exists to win, so the trade is not
+    clearly positive here the way it is for the two kernels whose opening
+    gather reads global memory."""
     comptime assert re.flat_rank == 2, "expected (rows, N) tensor"
     comptime assert im.flat_rank == 2, "expected (rows, N) tensor"
     comptime assert p_re.flat_rank == 2, "expected (rows, N) tensor"
@@ -545,7 +587,7 @@ def fft_row_cmul_ifft_kernel[
             s_im[pos_b] = b_im
             barrier()
 
-            fft_lds_stages[N, 6, invert, TW](t_re, t_im, s_re, s_im, tid)
+            fft_lds_stages[N, 6, invert, TW, N // 2](t_re, t_im, s_re, s_im, tid)
         else:
             var src0 = bit_reverse_ct(tid, log2n)
             var src1 = bit_reverse_ct(tid + half, log2n)
@@ -566,7 +608,7 @@ def fft_row_cmul_ifft_kernel[
                 s_im[tid + half] = v1i
             barrier()
 
-            fft_lds_stages[N, 0, invert, TW](t_re, t_im, s_re, s_im, tid)
+            fft_lds_stages[N, 0, invert, TW, N // 2](t_re, t_im, s_re, s_im, tid)
 
         comptime if pass_i == 0:
             # The spectrum is in natural order in shared memory; multiply it
@@ -600,7 +642,7 @@ def fft_row_cmul_ifft_kernel[
 def ifft_row_cmul_broadcast_kernel[
     N: Int, D: Int, W2: Int,
     BLT: TensorLayout, ALT: TensorLayout, OLT: TensorLayout,
-    TW: Bool = False,
+    TW: Bool = False, THREADS: Int = N // 2,
 ](
     b_re: TileTensor[DType.float32, BLT, MutAnyOrigin],  # (D*W2, N)
     b_im: TileTensor[DType.float32, BLT, MutAnyOrigin],
@@ -616,7 +658,8 @@ def ifft_row_cmul_broadcast_kernel[
 
     `b` is a (D, W2, N) transposed spectrum flattened to (D*W2, N) rows; `a`
     is a single (W2, N) layer multiplied against every depth layer of `b`.
-    grid.x == D*W2, block.x == N // 2.
+    grid.x == D*W2, block.x == THREADS (see `fft_row_kernel` for what
+    `THREADS` trades).
 
     This replaces the `transpose_kernel_cmul_broadcast -> fft_row_kernel(inv)`
     pair the back-projection chain used to run. That pair existed only
@@ -649,6 +692,9 @@ def ifft_row_cmul_broadcast_kernel[
     comptime assert dst_re.flat_rank == 2, "expected (D*W2, N) tensor"
     comptime log2n = ilog2_ct(N)
     comptime half = N // 2
+    comptime heads = half // THREADS
+    comptime elems = N // THREADS
+    comptime assert half % THREADS == 0, "THREADS must divide N/2"
 
     # `d` fastest, `w` slowest -- see the docstring.
     var d = block_idx.x % D
@@ -661,65 +707,64 @@ def ifft_row_cmul_broadcast_kernel[
 
     var t_re = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
-    fill_twiddle_table[N, TW](t_re, t_im, tid, N // 2)
+    fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
     comptime if N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
-        var pos_a = 64 * warp + lane
-        var pos_b = pos_a + 32
-        var src_a = bit_reverse_ct(pos_a, log2n)
-        var src_b = bit_reverse_ct(pos_b, log2n)
+        # One head block at a time; see `fft_row_kernel` for why this is a
+        # sequential loop rather than four elements held at once, and why
+        # the stride is `num_warps`.
+        comptime num_warps = THREADS // 32
+        comptime for h in range(heads):
+            var blk = warp + h * num_warps
+            var pos_a = 64 * blk + lane
+            var pos_b = pos_a + 32
+            var src_a = bit_reverse_ct(pos_a, log2n)
+            var src_b = bit_reverse_ct(pos_b, log2n)
 
-        var xar = rebind[Scalar[DType.float32]](a_re[w, src_a])
-        var xai = rebind[Scalar[DType.float32]](a_im[w, src_a])
-        var xbr = rebind[Scalar[DType.float32]](b_re[brow, src_a])
-        var xbi = rebind[Scalar[DType.float32]](b_im[brow, src_a])
-        var yar = rebind[Scalar[DType.float32]](a_re[w, src_b])
-        var yai = rebind[Scalar[DType.float32]](a_im[w, src_b])
-        var ybr = rebind[Scalar[DType.float32]](b_re[brow, src_b])
-        var ybi = rebind[Scalar[DType.float32]](b_im[brow, src_b])
+            var xar = rebind[Scalar[DType.float32]](a_re[w, src_a])
+            var xai = rebind[Scalar[DType.float32]](a_im[w, src_a])
+            var xbr = rebind[Scalar[DType.float32]](b_re[brow, src_a])
+            var xbi = rebind[Scalar[DType.float32]](b_im[brow, src_a])
+            var yar = rebind[Scalar[DType.float32]](a_re[w, src_b])
+            var yai = rebind[Scalar[DType.float32]](a_im[w, src_b])
+            var ybr = rebind[Scalar[DType.float32]](b_re[brow, src_b])
+            var ybi = rebind[Scalar[DType.float32]](b_im[brow, src_b])
 
-        var a_re_v = xar * xbr - xai * xbi
-        var a_im_v = xar * xbi + xai * xbr
-        var b_re_v = yar * ybr - yai * ybi
-        var b_im_v = yar * ybi + yai * ybr
+            var a_re_v = xar * xbr - xai * xbi
+            var a_im_v = xar * xbi + xai * xbr
+            var b_re_v = yar * ybr - yai * ybi
+            var b_im_v = yar * ybi + yai * ybr
 
-        fft_warp_head[N, True, TW](t_re, t_im, a_re_v, a_im_v, b_re_v, b_im_v, lane)
+            fft_warp_head[N, True, TW](t_re, t_im, a_re_v, a_im_v, b_re_v, b_im_v, lane)
 
-        s_re[pos_a] = a_re_v
-        s_im[pos_a] = a_im_v
-        s_re[pos_b] = b_re_v
-        s_im[pos_b] = b_im_v
+            s_re[pos_a] = a_re_v
+            s_im[pos_a] = a_im_v
+            s_re[pos_b] = b_re_v
+            s_im[pos_b] = b_im_v
         barrier()
 
-        fft_lds_stages[N, 6, True, TW](t_re, t_im, s_re, s_im, tid)
+        fft_lds_stages[N, 6, True, TW, THREADS](t_re, t_im, s_re, s_im, tid)
     else:
-        var src0 = bit_reverse_ct(tid, log2n)
-        var src1 = bit_reverse_ct(tid + half, log2n)
-
-        var xar = rebind[Scalar[DType.float32]](a_re[w, src0])
-        var xai = rebind[Scalar[DType.float32]](a_im[w, src0])
-        var xbr = rebind[Scalar[DType.float32]](b_re[brow, src0])
-        var xbi = rebind[Scalar[DType.float32]](b_im[brow, src0])
-        var yar = rebind[Scalar[DType.float32]](a_re[w, src1])
-        var yai = rebind[Scalar[DType.float32]](a_im[w, src1])
-        var ybr = rebind[Scalar[DType.float32]](b_re[brow, src1])
-        var ybi = rebind[Scalar[DType.float32]](b_im[brow, src1])
-
-        s_re[tid] = xar * xbr - xai * xbi
-        s_im[tid] = xar * xbi + xai * xbr
-        s_re[tid + half] = yar * ybr - yai * ybi
-        s_im[tid + half] = yar * ybi + yai * ybr
+        comptime for e in range(elems):
+            var dst = tid + e * THREADS
+            var src = bit_reverse_ct(dst, log2n)
+            var xar = rebind[Scalar[DType.float32]](a_re[w, src])
+            var xai = rebind[Scalar[DType.float32]](a_im[w, src])
+            var xbr = rebind[Scalar[DType.float32]](b_re[brow, src])
+            var xbi = rebind[Scalar[DType.float32]](b_im[brow, src])
+            s_re[dst] = xar * xbr - xai * xbi
+            s_im[dst] = xar * xbi + xai * xbr
         barrier()
 
-        fft_lds_stages[N, 0, True, TW](t_re, t_im, s_re, s_im, tid)
+        fft_lds_stages[N, 0, True, TW, THREADS](t_re, t_im, s_re, s_im, tid)
 
     comptime inv_n: Float32 = 1.0 / Float32(N)
-    dst_re[brow, tid] = rebind[dst_re.ElementType](s_re[tid] * inv_n)
-    dst_im[brow, tid] = rebind[dst_im.ElementType](s_im[tid] * inv_n)
-    dst_re[brow, tid + half] = rebind[dst_re.ElementType](s_re[tid + half] * inv_n)
-    dst_im[brow, tid + half] = rebind[dst_im.ElementType](s_im[tid + half] * inv_n)
+    comptime for e in range(elems):
+        var o = tid + e * THREADS
+        dst_re[brow, o] = rebind[dst_re.ElementType](s_re[o] * inv_n)
+        dst_im[brow, o] = rebind[dst_im.ElementType](s_im[o] * inv_n)
 
 
 def rfft_row_kernel[
@@ -2309,7 +2354,7 @@ def rfft_w_div_transposed_gpu[
 
 
 def rfft2_batched_gpu_div_t[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -2327,16 +2372,17 @@ def rfft2_batched_gpu_div_t[
     comptime W2 = W // 2 + 1
     rfft_w_div_transposed_gpu[D, H, W, TILE, TW](ctx, a_buf, b_buf, out_re, out_im, t_re, t_im)
 
+    comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
-        grid_dim=D * W2, block_dim=H // 2,
+        grid_dim=D * W2, block_dim=HT,
     )
 
 
 def irfft2_batched_gpu_cmul_broadcast_mul_t[
-    D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool, TW: Bool = False
+    D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool, TW: Bool = False, TDIV: Int = 2
 ](
     ctx: DeviceContext,
     mut a_re: DeviceBuffer[DType.float32],  # (W/2+1, H), broadcast over depth
@@ -2376,14 +2422,15 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     comptime W2 = W // 2 + 1
     comptime a_row_layout = row_major[W2, H]()
     comptime b_row_layout = row_major[D * W2, H]()
+    comptime HT = H // TDIV
     comptime kernel_h = ifft_row_cmul_broadcast_kernel[
-        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW
+        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW, HT
     ]
     ctx.enqueue_function[kernel_h](
         TileTensor(b_re, b_row_layout), TileTensor(b_im, b_row_layout),
         TileTensor(a_re, a_row_layout), TileTensor(a_im, a_row_layout),
         TileTensor(t_re, b_row_layout), TileTensor(t_im, b_row_layout),
-        grid_dim=D * W2, block_dim=H // 2,
+        grid_dim=D * W2, block_dim=HT,
     )
 
     comptime in_layout_b = row_major[D, W2, H]()
@@ -2504,7 +2551,7 @@ def fft_col_cmul_ifft_gpu[
 
 
 def rfft2_batched_gpu_t[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2522,16 +2569,17 @@ def rfft2_batched_gpu_t[
     comptime W2 = W // 2 + 1
     rfft_w_transposed_gpu[D, H, W, TILE, TW](ctx, x_buf, out_re, out_im, t_re, t_im)
 
+    comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
-        grid_dim=D * W2, block_dim=H // 2,
+        grid_dim=D * W2, block_dim=HT,
     )
 
 
 def irfft2_batched_gpu_t[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2544,11 +2592,12 @@ def irfft2_batched_gpu_t[
     spectrum -> a (D, H, W) real buffer. `in_re`/`in_im` are used as scratch
     and left in an undefined state."""
     comptime W2 = W // 2 + 1
+    comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW, HT]
     ctx.enqueue_function[kernel_h](
         TileTensor(in_re, row_layout_h), TileTensor(in_im, row_layout_h),
-        grid_dim=D * W2, block_dim=H // 2,
+        grid_dim=D * W2, block_dim=HT,
     )
 
     irfft_w_from_transposed_gpu[D, H, W, TILE, TW](ctx, in_re, in_im, out_x, t_re, t_im)

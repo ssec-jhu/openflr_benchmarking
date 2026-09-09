@@ -5,9 +5,12 @@ step to a file for offline correctness comparison against the numpy
 reference.
 
 Usage:
-    mojo run main.mojo -- v1 20        # benchmark v1, 20 iterations
-    mojo run main.mojo -- v2 20        # benchmark v2, 20 iterations
-    mojo run main.mojo -- v1 1 --dump out.bin   # single step, dump result
+    mojo run main.mojo -- v2 20            # all arms, 20 iterations each
+    mojo run main.mojo -- v2 20 t4         # one arm (what a profiler wants)
+    mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
+
+Arms: `base` (TW=False, TDIV=2, bit-identical to the pre-flag kernels),
+`tw` (shared twiddle table), `t4` (half-size column-FFT blocks).
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -139,8 +142,7 @@ def main() raises:
     var version = "v2"
     var n_iters = 20
     var dump_path = ""
-    var dump_tw = False
-    var arm = "both"
+    var arm = "all"
     var i = 1
     while i < len(args):
         var a = String(args[i])
@@ -151,13 +153,14 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "--tw":
-            dump_tw = True
-        elif a == "off" or a == "on":
+        elif a == "base" or a == "tw" or a == "t4":
             arm = a
         else:
             n_iters = Int(a)
         i += 1
+
+    if dump_path != "" and arm == "all":
+        arm = "base"
 
     var ctx = DeviceContext()
 
@@ -181,65 +184,66 @@ def main() raises:
     var out_buf = ctx.enqueue_create_buffer[DType.float32](N)
     var scratch = OpenFlrScratch[D, H, W](ctx)
 
-    if dump_path != "":
-        # One step, dumped for `verify_correctness.py`. Both twiddle
-        # strategies are dumped from the same entry point so the harness can
-        # check each against numpy: `--tw` picks the table.
-        if dump_tw:
-            if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, True](
-                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
-                )
-            else:
-                run_v2_step_gpu[D, H, W, TILE, True](
-                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
-                )
+    # Three configurations, benchmarked in one process on one set of clocks
+    # so the numbers are directly comparable and a whole sweep costs one
+    # batch job on a cluster with no interactive access:
+    #
+    #   base  TW=False TDIV=2  -- bit-identical to the pre-flag kernels
+    #   tw    TW=True  TDIV=2  -- shared twiddle table (optimizations.md s.2)
+    #   t4    TW=False TDIV=4  -- half-size blocks on the two column-FFT
+    #                             kernels, so twice as many fit per SM
+    #                             (optimizations.md s.5)
+    #
+    # Naming one of `base`, `tw`, `t4` runs just that arm, which is what a
+    # profiler wants: every arm dispatches same-named kernels differing only
+    # in their name hash. `--dump <path>` writes one step's output for
+    # `verify_correctness.py` and defaults to `base` unless an arm is named.
+    # Settle the clocks before any arm is timed. Each arm already does one
+    # untimed call, but on a GPU ramping from idle that is not enough: the
+    # first arm measured would otherwise carry the ramp, and the arms run in
+    # a fixed order, so the bias lands on `base` every time.
+    for _ in range(5):
+        if version == "v1":
+            run_v1_step_gpu[D, H, W, TILE, False, 2](
+                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+            )
         else:
+            run_v2_step_gpu[D, H, W, TILE, False, 2](
+                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+            )
+    ctx.synchronize()
+
+    comptime for arm_i in range(3):
+        comptime TW = arm_i == 1
+        comptime TDIV = 4 if arm_i == 2 else 2
+        comptime arm_name = "tw" if arm_i == 1 else ("t4" if arm_i == 2 else "base")
+
+        if arm == "all" or arm == arm_name:
             if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, False](
+                run_v1_step_gpu[D, H, W, TILE, TW, TDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                 )
             else:
-                run_v2_step_gpu[D, H, W, TILE, False](
-                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
-                )
-        ctx.synchronize()
-        var result = download[N](ctx, out_buf)
-        write_floats(dump_path, result, N)
-        print("wrote", dump_path)
-        return
-
-    # Benchmark the twiddle strategies: `TW=False` is the inline per-thread
-    # `cos`/`sin` the kernels have always used, `TW=True` the shared twiddle
-    # table. Both by default, in one process on one set of clocks, so the two
-    # numbers are directly comparable and the A/B costs one batch job on a
-    # cluster with no interactive access. Pass `off` or `on` to run a single
-    # arm -- which is what a profiler wants, since both arms dispatch
-    # same-named kernels and only their name hashes differ.
-    comptime for tw_i in range(2):
-        comptime TW = tw_i == 1
-        comptime arm_name = "on" if TW else "off"
-
-        if arm == "both" or arm == arm_name:
-            if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, TW](
-                    ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
-                )
-            else:
-                run_v2_step_gpu[D, H, W, TILE, TW](
+                run_v2_step_gpu[D, H, W, TILE, TW, TDIV](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                 )
             ctx.synchronize()
+
+            if dump_path != "":
+                var result = download[N](ctx, out_buf)
+                write_floats(dump_path, result, N)
+                print("wrote", dump_path, "(" + arm_name + ")")
+                return
 
             var times: List[Float64] = []
             for _ in range(n_iters):
                 var start = perf_counter_ns()
                 if version == "v1":
-                    run_v1_step_gpu[D, H, W, TILE, TW](
+                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                     )
                 else:
-                    run_v2_step_gpu[D, H, W, TILE, TW](
+                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                     )
                 ctx.synchronize()
@@ -249,11 +253,10 @@ def main() raises:
                 data_buf = out_buf
                 out_buf = tmp
 
-            var label = "on " if TW else "off"
             var stats = mean_std(times^, n_iters)
             print(
-                "backend: mojo, version:", version, ", twiddle table:", label,
+                "backend: mojo, version:", version, ", arm:", arm_name,
                 ", mean time:", stats[0], "s, std time:", stats[1], "s",
                 file=stderr,
             )
-            print("twiddle_table=" + label, stats[0], "\\pm", stats[1])
+            print("arm=" + arm_name, stats[0], "\\pm", stats[1])
