@@ -10,10 +10,13 @@ Usage:
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
 Arms: `base` (the pre-flag kernels), `t4w8c4` (kept as the cross-run
-anchor), `t8w8c4G` (the best measured configuration), and `t8w8c4Gi8` /
+anchor), `t8w8c4G` (the best measured configuration), `t8w8c4Gi8` /
 `t8w16c4G`, which re-ask two block-size questions that were last answered
-before the coalesced gather landed. All five are bit-identical: they only
-remap work across threads and memory.
+before the coalesced gather landed, and `t8w8c4Gtw`, which re-asks the
+twiddle-table question on hardware where the SFU:DRAM ratio is 1.23x worse
+than the A100 it lost on. The first five are bit-identical -- they only
+remap work across threads and memory; `t8w8c4Gtw` is not, because a table
+is a different rounding of the same twiddle.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -157,7 +160,7 @@ def main() raises:
             i += 1
             dump_path = String(args[i])
         elif (a == "base" or a == "t4w8c4" or a == "t8w8c4G"
-              or a == "t8w8c4Gi8" or a == "t8w16c4G"):
+              or a == "t8w8c4Gi8" or a == "t8w16c4G" or a == "t8w8c4Gtw"):
             arm = a
         else:
             n_iters = Int(a)
@@ -214,8 +217,34 @@ def main() raises:
     #                             other stale block-size answer (-0.19% on
     #                             v2 pre-gather, close enough to nothing to
     #                             flip)
+    #   t8w8c4Gtw + TW=True     -- the retired `tw` shared twiddle table,
+    #                             un-retired for the H100. It lost 6-11% on
+    #                             the A100 because Mojo's cos/sin lower to a
+    #                             short SFU sequence there, so trading them
+    #                             for shared-memory loads was a bad deal.
+    #                             The deal is 1.23x worse on an H100 in one
+    #                             direction only: A100 -> H100 NVL scales
+    #                             DRAM by 1.91x but SMs x clock -- and with
+    #                             them the SFU, the shared-memory pipe and
+    #                             the instruction issue rate -- by only
+    #                             1.55x, and mojo's own measured scaling is
+    #                             1.49x against jax's 1.92x. So this arm
+    #                             discriminates: if the SFU is what binds
+    #                             these kernels it should now win, and if
+    #                             shared memory is, it should lose by more
+    #                             than it did on the A100. The one arm that
+    #                             is *not* bit-exact with `base` -- a table
+    #                             is a different rounding of the same
+    #                             quantity -- so `verify_correctness.py`
+    #                             holds it to the numpy tolerance only.
+    #                             Measured: 2.1% of outputs differ from
+    #                             `base` by at most 2.861e-06, against the
+    #                             8.583e-06 the pipeline already differs
+    #                             from numpy by.
     #
-    # Retired after being measured: `tw` (a shared twiddle table), `t8`
+    # Retired after being measured: `tw` (a shared twiddle table -- back as
+    # `t8w8c4Gtw` above, on the strength of the H100's different
+    # SFU:DRAM ratio, not of any new argument about the A100), `t8`
     # (both column kernels at 256 threads -- a win and a larger loss added
     # together, see the `i8` session), `t4w16`, `t4w8c4i8`, `t4w8`, and
     # `t4w8c4g` (CG on `fft_row_kernel` alone, superseded by CG=2).
@@ -236,21 +265,20 @@ def main() raises:
     # within 0.2% while `base` alone moved 4.4% and carried a 7-8% standard
     # deviation. Two seconds covers the ramp both on an A100 (~15 ms per
     # iteration) and on a far slower iGPU (~60 ms).
+    # The warmup runs with *the arm that is about to be timed* (see the
+    # first-arm block inside the sweep below), not with a hard-coded `base`.
+    # That distinction only matters for a single-arm run, and there it
+    # matters a lot: with a fixed `base` warmup, `nsys profile ... -- v2 3
+    # t8w8c4G` captured ~135 `base` iterations and 3 of the arm, so any
+    # aggregate report described `base` and merged the two wherever a kernel
+    # name was unchanged. With `arm == "all"` the first arm executed is
+    # `base` with exactly the parameters this loop used to hard-code, so
+    # sweep numbers are unchanged by construction.
     comptime WARMUP_NS = 2_000_000_000
-    var w_start = perf_counter_ns()
-    while perf_counter_ns() - w_start < WARMUP_NS:
-        if version == "v1":
-            run_v1_step_gpu[D, H, W, TILE, False, 2](
-                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
-            )
-        else:
-            run_v2_step_gpu[D, H, W, TILE, False, 2](
-                ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
-            )
-        ctx.synchronize()
+    var warmed = False
 
     # Two passes over the arms, the second in reverse order. On the A100 the
-    # only drift was a clock ramp at the very start, which the warmup above
+    # only drift was a clock ramp at the very start, which the warmup
     # covers. On an H100 NVL it is the opposite: the first two arms
     # reproduce to 0.04-0.11% while the third carries 3.2% -- drift that
     # develops *during* the run (thermal or power capping on a ~350 W card),
@@ -266,9 +294,9 @@ def main() raises:
     # standalone `make time-jax-v2` does not, and that bias does not cancel
     # between processes.
     comptime for pass_i in range(2):
-      comptime for slot in range(5):
-        comptime arm_i = slot if pass_i == 0 else 4 - slot
-        comptime TW = False
+      comptime for slot in range(6):
+        comptime arm_i = slot if pass_i == 0 else 5 - slot
+        comptime TW = arm_i == 5
         comptime TDIV = 2 if arm_i == 0 else (4 if arm_i == 1 else 8)
         comptime WDIV = 4 if arm_i == 0 else (16 if arm_i == 4 else 8)
         comptime CDIV = 4 if arm_i >= 1 else 2
@@ -279,9 +307,24 @@ def main() raises:
         comptime CG = 0 if arm_i <= 1 else 2
         comptime arm_name = "t4w8c4" if arm_i == 1 else (
             "t8w8c4G" if arm_i == 2 else ("t8w8c4Gi8" if arm_i == 3 else (
-                "t8w16c4G" if arm_i == 4 else "base")))
+                "t8w16c4G" if arm_i == 4 else (
+                    "t8w8c4Gtw" if arm_i == 5 else "base"))))
 
         if arm == "all" or arm == arm_name:
+            if not warmed:
+                warmed = True
+                var w_start = perf_counter_ns()
+                while perf_counter_ns() - w_start < WARMUP_NS:
+                    if version == "v1":
+                        run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
+                            ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
+                        )
+                    else:
+                        run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
+                            ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
+                        )
+                    ctx.synchronize()
+
             if version == "v1":
                 run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch

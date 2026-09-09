@@ -152,32 +152,61 @@ already tried here. **There is headroom on H100, and the way to it is an
 `nsys`/`ncu` pass on that card, not an extrapolation from the A100
 profile.**
 
+The last session in this file takes that scaling table one step further:
+1.49x is not just "less than 1.91x", it is within 4% of the A100 -> H100
+ratio of *SMs times clock* (1.547x), which is the scaling factor of every
+per-SM-per-clock resource on this card pair -- shared memory, L1
+wavefronts, instruction issue, SFU, barriers. Read that session for the
+arithmetic, its three weaknesses, and the per-kernel prediction the
+profile now tests.
+
 An incidental correction: this file previously worried that H100 NVL's lower
 power budget would make it slower than the SXM5 in `../results.md`. Wrong --
 jax runs 7.5-8.7% *faster* on the NVL, consistent with its higher bandwidth
 on a workload this memory-heavy. NVL is a fair, and slightly favourable,
 place to measure.
 
-### One measurement caveat that cuts against mojo here
+### The sweep-heating caveat was wrong -- tested and dropped
 
-`t8w8c4G` is the third of five arms in a single process; `make time-jax-v2`
-is a standalone run. On this card the arm order is *not* neutral -- `base`
-and `t4w8c4` reproduce to 0.04-0.11% while `t8w8c4G` carries 3.19% relative
-standard deviation, drift that develops during the run on a ~350 W card. So
-the mojo figure is measured on a hotter card than the jax figure, and the
-7.4% v2 loss is an upper bound on the true gap rather than a point estimate.
+The previous entry worried that `t8w8c4G` being the third of five arms in
+one process measured it on a hotter card than a standalone `make
+time-jax-v2`, and called the v2 loss an upper bound. **Tested with a
+single-arm run, and it is not true:**
 
-Two changes came out of this:
+| | 5-arm sweep | single arm, counterbalanced | difference |
+|---|---|---|---|
+| v1 | 0.008488 | 0.008487 +- 0.000045 | **-0.02%** |
+| v2 | 0.006269 | 0.006201 +- 0.000065 | **-1.10%** |
 
-- `main.mojo` now sweeps the arms **twice, the second pass in reverse
-  order**, printing `arm=<name> pass=<0|1>`. Every arm is measured once
-  early and once late; the positions sum to a constant, so averaging the
-  pair cancels linear drift and the spread between them measures how much
-  there was. On the iGPU the two passes agree to 0.09%.
-- **For a cross-backend comparison, name a single arm**
-  (`-- v2 20 t8w8c4G`). A five-arm sweep heats the card in a way a
-  standalone jax run does not, and that bias does not cancel between
-  processes.
+So the sweep costs at most about 1% on v2 and nothing measurable on v1. The
+H100 result stands as measured.
+
+**Final H100 NVL standing, single-arm, same node as jax:**
+
+| | mojo `t8w8c4G` | jax | mojo vs jax |
+|---|---|---|---|
+| v1 | 0.008487 | 0.008887 | **4.5% faster** |
+| v2 | 0.006201 | 0.005837 | **6.2% slower** |
+
+Both outside the node's noise floor, which is 1.4-1.9% relative standard
+deviation for *jax* as well -- this node is simply less reproducible than
+the A100 one, for everybody. Read those two figures as +-2%.
+
+### What the two-pass harness actually bought
+
+Not a bias correction -- there was no bias to correct. Two other things:
+
+- It **disproved a plausible hypothesis in one run** instead of leaving it
+  as a permanent asterisk on the number. That is the cheapest thing it will
+  ever do and it already paid for itself.
+- It exposed a **1-2% early/late spread** on this card that a single-pass
+  measurement carries silently: pass 0 comes in 1.07% (v1) and 2.10% (v2)
+  *faster* than pass 1, and pass 0 is also the noisy one (2.35% relative
+  std against 0.05%). The card starts fast and unsettled and lands slower
+  and stable, and 2 s of warmup does not get it there. Any single-pass
+  number from this node is worth +-2% whatever its own reported std says --
+  note that the clean-looking 0.05% on pass 1 is exactly the kind of tight
+  standard deviation that would otherwise be quoted as precision.
 
 ## The one thing to internalise before optimising anything
 
@@ -211,13 +240,21 @@ Measure.
 ## How to run things
 
 ```
-pixi run mojo run src/main.mojo -- v2 20        # all four arms, one process
-pixi run mojo run src/main.mojo -- v2 20 t4     # one arm (what a profiler wants)
-pixi run verify                                 # every arm vs numpy, full scale
-pixi run test                                   # unit tests
+pixi run mojo run src/main.mojo -- v2 20            # all six arms, one process
+pixi run mojo run src/main.mojo -- v2 20 t8w8c4G    # one arm
+pixi run verify                                     # every arm vs numpy, full scale
+pixi run test                                       # unit tests
+
+./profile_card.sh v2 t8w8c4G   # nsys per-kernel attribution + sustained clocks
+./ncu_card.sh     v2 t8w8c4G   # which resource binds: DRAM, LDS, LSU or SFU
+python3 prof_report.py foo.sqlite   # re-read an exported trace on its own
 ```
 
-The four arms, selected by compile-time parameters threaded from
+The two scripts write `<gpu>_<version>_<arm>.{prof,ncu}.txt` next to
+themselves, so running the same command on two cards gives two files whose
+per-kernel rows divide straight into a scaling ratio.
+
+The six arms, selected by compile-time parameters threaded from
 `main.mojo` down to the kernels:
 
 | arm | `TDIV` | `WDIV` | `CDIV` | `IDIV` | `CG` | what it is |
@@ -227,16 +264,20 @@ The four arms, selected by compile-time parameters threaded from
 | `t8w8c4G` | 8 | 8 | 4 | 4 | 2 | **best measured** -- coalesced gather everywhere |
 | `t8w8c4Gi8` | 8 | 8 | 4 | **8** | 2 | retest of the 4.28% loser, post-gather |
 | `t8w16c4G` | 8 | **16** | 4 | 4 | 2 | retest of the 0.19% loser, post-gather |
+| `t8w8c4Gtw` | 8 | 8 | 4 | 4 | 2 | `TW=True`: the un-retired twiddle table. SFU vs shared memory, on H100 |
 
 `CG` is the one knob that is not a block size: 0 off, 1 on
 `fft_row_kernel` only, 2 on every row-FFT kernel. The rest are: `TDIV` gives
 `fft_row_kernel` `H/TDIV` threads,
 `WDIV` the four width-axis kernels `W/WDIV`, `CDIV` the fused
 forward-multiply-inverse column kernel `H/CDIV`, `IDIV`
-`ifft_row_cmul_broadcast_kernel` `H/IDIV`. All four arms are bit-identical to
-each other by construction and `pixi run verify` asserts it: they only remap
-work across threads. Keep that invariant -- it is what makes an A/B
-trustworthy.
+`ifft_row_cmul_broadcast_kernel` `H/IDIV`. `TW` is the other: a shared
+twiddle table instead of a per-thread `cos`/`sin`. Every arm but
+`t8w8c4Gtw` is bit-identical to the others by construction and `pixi run
+verify` asserts it: they only remap work across threads. Keep that
+invariant -- it is what makes an A/B trustworthy. `t8w8c4Gtw` is the
+documented exception, held to the numpy tolerance instead, because a table
+is a different rounding of the same quantity.
 
 **`t4w8c4` is the cross-run anchor**, measured on four runs at
 0.013606 / 0.013597 / 0.013616 / 0.013616 on v2. If it moves more than ~0.1%
@@ -245,49 +286,66 @@ in it should be trusted either. (`t4w8` held that job before it and
 reproduced to 0.07%; it was retired to make room.)
 
 Five arms have been retired after being measured and losing: `tw` (a shared
-twiddle table, sec. `tw`), `t8` (both column kernels at 256 threads),
+twiddle table, sec. `tw` -- now un-retired as `t8w8c4Gtw`, because the
+H100's SFU:DRAM ratio changes its terms), `t8` (both column kernels at 256 threads),
 `t4w16` (128-thread width blocks), `t4w8c4i8` (256-thread
 `ifft_row_cmul_broadcast_kernel`, +4.3% on v2) and `t4w8` (superseded).
 
 ## What must be done, in order
 
-**The brief is satisfied -- everything below is optional.** Mojo beats JAX
-by 1.22-1.36x. Stop here unless there is a reason to keep going, and if
-there is, do it in this order.
+**The A100 brief is satisfied -- everything below is optional.** Mojo beats
+JAX there by 1.22-1.36x. The live question is the H100, where v1 is 4.5%
+ahead and v2 is 6.2% behind, and where the last session found a scaling
+fingerprint saying the binding resource is inside the SM rather than at
+DRAM. Read that session (the last one in this file) before starting.
 
-**0. Re-profile.** Nothing else should be started first. v2 went 13.7 -> 9.2
-ms and the kernel mix inside it has moved completely; the breakdown in the
-profile session describes a pipeline that no longer exists. The recipe (and
-the warmup trap that makes an arm profile 97% `base`) is in the traps list
-below.
+**0. Take the two profiles.** Nothing else should be started first, and it
+is now one command per card: `./profile_card.sh v2 t8w8c4G` on the H100 and
+on the A100. Two reasons it has to be both cards. The A100 breakdown in
+this file is pre-gather -- v2 went 13.7 -> 9.2 ms and the kernel mix moved
+completely, so it describes a pipeline that no longer exists. And a
+per-kernel A100 -> H100 ratio needs a denominator. The prediction under
+test is in the last session: non-FFT kernels at ~1.9x, FFT kernels at
+~1.4x. The warmup trap that used to make an arm profile 97% `base` is
+fixed; the `ncu` equivalent (9 PSF-prep launches at `base` parameters
+before any arm runs) is handled in `ncu_card.sh`.
 
-**1. Validate the byte model while `ncu` is out.** `dram__bytes_read` on two
-or three dispatches. Every GB/s figure in this file is a model of *intended*
-traffic, none has ever been checked, and the gather finding is precisely a
-case the model was blind to -- 8x the L1 wavefronts, almost no extra DRAM
-traffic, invisible, and worth 31%. Also worth
-`l1tex__t_sectors_pipe_lsu_mem_global_op_ld` before and after `CG` to
-confirm the mechanism directly rather than by inference.
+**1. Resolve which per-SM resource binds**, with `./ncu_card.sh v2 t8w8c4G`
+on the H100. Shared-memory bandwidth, L1 wavefronts, instruction issue and
+the SFU all scale at the same 1.547x, so the fingerprint identifies the
+class and cannot resolve within it. This also closes the standing
+byte-model question below, since group A is `dram__bytes` on the same
+dispatches.
 
-**2. The two stale block-size retests** (`t8w8c4Gi8`, `t8w16c4G`), which
-ride along in any benchmark run. Cheap, and neither deserves a second round
-if it loses.
+**2. Validate the byte model while `ncu` is out** -- group A of the above.
+Every GB/s figure in this file is a model of *intended* traffic, none has
+ever been checked, and the gather finding is precisely a case the model was
+blind to: 8x the L1 wavefronts, almost no extra DRAM traffic, invisible,
+and worth 31%. `l1tex__t_sectors_pipe_lsu_mem_global_op_ld` before and
+after `CG` would confirm that mechanism directly rather than by inference.
 
-**3. Structural levers on the FFT kernels**, chosen from the new profile:
-shared-memory traffic and barriers per row -- radix-8 fused stages, or
-holding more of the transform in registers across stages. Not block size,
-which is spent.
+**3. The three retests that ride along in any benchmark run** --
+`t8w8c4Gi8` and `t8w16c4G` (stale block-size answers, and both already
+*lost harder* on the H100: 9.2% and 12.4%) and `t8w8c4Gtw` (the twiddle
+table, which discriminates SFU from shared memory -- see the last session).
+Free; none deserves a second round if it loses.
 
-**3. Get `t4` to 4 blocks/SM.** It currently gets 3: registers went 31 ->
+**4. Structural levers on the FFT kernels**, chosen from the new profile.
+If the fingerprint holds, the target is per-SM work per byte rather than
+bytes: shared-memory round trips and barriers per row -- radix-8 fused
+stages, or holding more of the transform in registers across stages. Not
+block size, which is spent, and not byte-count reduction, which is what the
+older iGPU-era sections optimise for.
+
+**5. Get `t4` to 4 blocks/SM.** It currently gets 3: registers went 31 ->
 40 because the compiler hoists both head blocks' global loads together
 despite the sequential structure, and 512 threads need <= 32 registers for
 4 blocks. There is **no `__launch_bounds__` equivalent in this Mojo
 version** (checked the compiled stdlib for `launch_bounds`, `maxntid`,
 `minnctapersm`, `max_registers`), so the only lever found so far is a
 scheduling barrier between head blocks, which costs a `barrier()` -- the
-very thing being minimised. Low priority unless something cheaper appears.
-
-
+very thing being minimised. Low priority unless something cheaper appears,
+and occupancy has been ruled out as the variable twice.
 
 ## Traps, all of them paid for
 
@@ -333,7 +391,22 @@ very thing being minimised. Low priority unless something cheaper appears.
   On older `nsys` the report is called `gpukernsum`, not `cuda_gpu_kern_sum`.
   Remember the 2 s warmup runs first, so the trace covers many identical
   iterations -- good for the aggregate, and it means per-dispatch clock-step
-  checks need the sqlite, not the summary.
+  checks need the sqlite, not the summary. `./profile_card.sh` is this
+  recipe plus clock sampling, and `prof_report.py` replaces the SQL above
+  with something that does not need the `sqlite3` CLI.
+- **The warmup used to run `base` whatever arm you asked for**, so a
+  single-arm `nsys` trace was ~97% `base` and merged the two wherever a
+  kernel name was unchanged. **Fixed** -- the warmup now runs the arm about
+  to be timed. Any trace or report in this file dated before that fix
+  describes `base` unless it was built per-dispatch by hand.
+- **`prepare_psf` dispatches 9 kernels at `base` parameters before any arm
+  runs**, because it calls `rfft2_batched_gpu_t` three times at that
+  overload's defaults (`TDIV=2, WDIV=4, CG=0`) and each call is 3 kernels.
+  `ncu` counts from launch 0, so profile without skipping them and a third
+  of a 20-launch report describes the wrong configuration. `ncu_card.sh`
+  skips 9. `nsys` aggregates are diluted rather than wrong, but
+  `prof_report.py`'s per-iteration table takes the *last* iteration and so
+  avoids them entirely.
 - **`fft_lds_stages` needs `THREADS` to divide `N/2`.** Its fused stages
   have `N/4` tasks and its odd stage `N/2`; both now loop
   `ceil(tasks/THREADS)` times. Before that was fixed, `THREADS < N/4`
@@ -3302,3 +3375,279 @@ each, cheapest first:
 Neither is a hypothesis about a mechanism, and neither should get a second
 round if it loses: they are cheap retests of stale measurements, nothing
 more. **The substantive next step is to re-profile** -- see item 1.
+
+---
+
+# Session: the H100 shortfall has a scaling fingerprint, and it points away from DRAM
+
+No H100 access from this session, so this is arithmetic plus the
+instrumentation needed to check it. The arithmetic is cheap and it makes
+falsifiable per-kernel predictions, which is more than the previous H100
+entry left behind ("there is headroom, go find it with `ncu`").
+
+## The observation, restated as a ratio
+
+The previous session measured both backends on both cards and noted that
+jax scales at the bandwidth ratio while we do not. Put every relevant
+ratio in one table and the shortfall stops looking like a mystery:
+
+| A100-SXM4-80GB -> H100 NVL | ratio | what it is |
+|---|---|---|
+| DRAM bandwidth (2039 -> 3900 GB/s) | **1.913x** | |
+| **jax** v1 / v2 | **1.938x / 1.919x** | within 1.3% of DRAM |
+| SMs x boost clock (108x1410 -> 132x1785) | **1.547x** | |
+| **mojo `t8w8c4G`** v1 / v2 | **1.491x / 1.487x** | within 3.9% of SMs x clock |
+| FP32 FMA peak (64 -> 128 cores/SM) | 3.092x | |
+
+jax lands on the DRAM ratio. We land on the SM-count-times-clock ratio.
+Neither is close to the other's number, and the FP32 ratio rules out plain
+arithmetic throughput in both directions.
+
+## Why 1.547x is a meaningful number and not a coincidence
+
+Between GA100 and GH100, **per SM per clock, most of the machine did not
+change**:
+
+- shared memory: 32 banks x 4 B/clk/SM on both
+- L1 / LSU: 128 B/clk/SM of load bandwidth, one wavefront per clock, on both
+- instruction issue: 4 warp schedulers x 1 instruction/clk on both
+- SFU/XU (which is what `cos`/`sin` issue on): 16/SM on both
+- barrier throughput: unchanged
+
+What did change is DRAM (1.913x), L2 capacity, and the FP32 core count per
+SM (2x, giving 3.092x with the clock). So **1.547x is the scaling factor of
+every per-SM-per-clock resource simultaneously**, and 1.913x is the scaling
+factor of DRAM alone. The two backends sit on opposite ones.
+
+That is a sharper claim than the A100 profile's "the FFT kernels are
+latency-bound at 22-37% of peak". Latency is not a resource; this says the
+binding resource is one that lives *inside* the SM, which is why 1.9x more
+DRAM bandwidth bought us 1.49x and bought cuFFT 1.92x.
+
+**What it does not say is which** per-SM resource. Shared-memory bandwidth,
+L1 wavefronts, instruction issue and the SFU all share the 1.547x number,
+so the fingerprint identifies the class and cannot resolve within it. That
+takes counters, which is what `ncu_card.sh` below is for.
+
+## The honest weaknesses in this argument
+
+Three, and the first is the one that would actually overturn it:
+
+1. **Those are boost-clock spec numbers, not measured sustained clocks.**
+   If the H100 NVL sustains 1600 MHz rather than 1785 under this load, the
+   predicted ratio falls to 1.387x and mojo's 1.487x sits *between* the two
+   candidate mechanisms instead of on one of them. The previous session
+   already saw this card drift 1-2% early-to-late on a ~350 W part, so this
+   is a live possibility, not a formality. `profile_card.sh` samples
+   `clocks.sm` through the run for exactly this reason.
+2. **It is a two-point fit on one card pair.** Two ratios agreeing to 4%
+   is suggestive, not conclusive, and this log has three recorded cases of
+   plausible arithmetic predicting the wrong sign.
+3. **It is an aggregate.** Which brings up the prediction worth testing.
+
+## The prediction that makes a profile decisive
+
+The A100 profile split the iteration 72% / 28% between kernels with an FFT
+butterfly in them (22-37% of DRAM peak) and kernels without one (69-87%).
+If that second group is genuinely near the DRAM roof, **it should scale at
+1.913x on its own**, and the aggregate has to come out of the two parts:
+
+```
+A100 v2 = 9.218 ms  ->  FFT part 6.637 ms, non-FFT part 2.581 ms
+H100 v2 = 6.201 ms  =  6.637/r_fft  +  2.581/1.913
+                    =  6.637/r_fft  +  1.349
+        =>  r_fft = 6.637/4.852 = 1.37x
+```
+
+So the fingerprint decomposes into a stronger statement than the aggregate
+made: the FFT kernels should be scaling at roughly **1.37x**, *below* even
+the SM-times-clock ratio, and the transposes / `complex_mul` /
+`sum_over_depth` should be scaling at roughly **1.91x**. Three outcomes,
+all informative:
+
+| per-kernel nsys result | what it means |
+|---|---|
+| non-FFT ~1.9x, FFT ~1.4x | as predicted. The lever is per-SM work inside the FFT kernels, and the other 28% is already done |
+| everything ~1.49x uniformly | nothing is at the DRAM roof on H100, including the kernels that were at 87% of it on the A100. Different problem, and a much more interesting one |
+| FFT ~1.55x, non-FFT ~1.9x | clean per-SM binding with no extra deficit; the 1.37x above is an artifact of using the stale pre-gather 72/28 split |
+
+The 72/28 split is the weak input here: it was measured on `t4w8c4`
+*before* the coalesced gather, and the gather moved v2 from 13.6 to 9.2 ms
+by taking most of it out of those same kernels. So `r_fft = 1.37x` is worth
+one significant figure at best. **This is also why the A100 has to be
+re-profiled on the same arm**, which was already item 0 on the standing
+list: without a post-gather A100 breakdown there is no denominator for any
+per-kernel ratio.
+
+## What was built: measurement, not optimization
+
+**1. The warmup now runs the arm that is about to be timed** (`main.mojo`).
+This was the single worst trap in the file: the warmup loop hard-coded
+`run_v*_step_gpu[..., False, 2]`, so `nsys profile ... -- v2 3 t8w8c4G`
+captured ~135 `base` iterations and 3 of the arm, and merged the two
+wherever a kernel name was unchanged. Any aggregate report of a single-arm
+trace described `base`. The previous session worked around it by hand,
+taking one iteration from each side of the configuration switch.
+
+The fix is not to shorten the warmup -- the 2 s exists to cover the clock
+ramp and the harness section says what breaks without it. The warmup moved
+*inside* the arm loop and runs, once, with the first-executed arm's
+parameters. With `arm == "all"` the first arm executed is `base` with
+exactly the parameters the loop used to hard-code, so **every sweep number
+in this file remains comparable by construction**; only single-arm traces
+change, and they change from unusable to usable. Verified on the iGPU:
+`t8w8c4G` at 0.063265 / 0.063770 s across the two passes, in line with the
+0.0633 s this arm has always measured there.
+
+**2. `prof_report.py` + `profile_card.sh`** -- the nsys recipe from the
+traps list, made repeatable and dependency-free. `prof_report.py` reads an
+exported sqlite with nothing but the standard library (no `sqlite3` CLI,
+which is not installed on every cluster node, and no pandas) and prints
+four tables: the per-kernel aggregate with all three occupancy limiters,
+one steady-state iteration in dispatch order, an early-vs-late duration per
+kernel, and the launch-gap check. `profile_card.sh` wraps it with
+`nvidia-smi` clock sampling through the run, which is what weakness (1)
+above needs.
+
+Validated against the existing `v2prof.sqlite`, where it reproduces this
+file's A100 numbers exactly: 1820 / 2048 / 3056 / 2908 us for the four big
+FFT dispatches, 13655 us for the iteration against the 13668 us recorded,
+and 0.10% of the iteration outside a kernel against the 0.2% recorded. It
+also shows the warmup trap directly -- 135 `base` dispatches against 4 of
+the arm, in the same table.
+
+Two details worth keeping. The iteration boundary is found by detecting the
+*period* of the dispatch-name sequence rather than assuming a dispatch
+count, so it works for v1 and v2 and survives a change to the pipeline. And
+the launch-gap check is computed **within one iteration**: over the whole
+trace it reports 47.6%, which is not dispatch overhead at all but the
+host-side gap between `ctx.synchronize()` and the next launch.
+
+**3. `ncu_card.sh`** -- two `ncu` invocations that resolve *which* per-SM
+resource binds, in the only form this GPU tolerates. Group A settles
+whether the byte model in this file is true (standing item 1: every GB/s
+figure here is *intended* traffic and none has ever been checked against
+`dram__bytes`) and how far from the DRAM roof these kernels are. Group B
+ranks the SM pipes against each other -- shared-memory wavefronts, bank
+conflicts, LSU/FMA/ALU/XU issue, barrier stall -- where XU is the SFU that
+the per-thread twiddle `cos`/`sin` issues on.
+
+Two metric groups rather than one set, because kernel replay has to save
+and restore the 1.4-2 GB each of these kernels writes once per pass, so
+pass count is the entire cost; `--set full` is hopeless here for that
+reason. And it skips the **first 9 launches**: `prepare_psf` calls
+`rfft2_batched_gpu_t` three times before any arm runs, at that overload's
+*default* parameters (`TDIV=2, WDIV=4, CG=0`, i.e. `base`), at 3 kernels a
+call. Profile from launch 0 and a third of the report describes the wrong
+configuration -- the same trap as the warmup, one layer down.
+
+**4. The `t8w8c4Gtw` arm** -- the retired twiddle table, un-retired,
+because the fingerprint changes its terms. `tw` lost 6-11% on the A100:
+Mojo's `cos`/`sin` lower to a short SFU sequence on NVIDIA rather than the
+~40-instruction routine that had been assumed, so trading them for
+shared-memory loads was a bad deal. **That deal is 1.23x worse on an H100
+in one direction only** -- DRAM got 1.913x faster and the SFU 1.547x -- and
+it discriminates between the two leading candidates within the per-SM
+class:
+
+- if the **SFU** is what binds these kernels, the table should now win
+- if **shared memory** is, the table adds traffic to the binding resource
+  and should lose by *more* than the 6-11% it lost on the A100
+
+Both outcomes are worth having, which is what makes it worth the ride.
+
+It compiles and runs, and on the gfx1151 iGPU it measures **0.062719 /
+0.062798 s** against `t8w8c4G`'s **0.063265 / 0.063770 s** -- 0.9% faster,
+which is inside that box's ~1-2% run-to-run spread and consistent with the
+"neutral on gfx1151" this arm recorded the first time. That is a smoke
+test, not evidence: the iGPU is DRAM-bound at 77-93% of achievable, has no
+SFU pressure to relieve, and is the one card in this file whose sign has
+been wrong about the A100 more than once. It says the code path still
+works.
+
+It is the one arm that is not bit-exact with `base` -- a table is a different
+rounding of the same quantity, not a different quantity -- so
+`verify_correctness.py` now derives `BIT_EXACT` by excluding it and holds
+it to the numpy tolerance only. That carve-out had been deleted when `tw`
+was retired; it is back, and documented as the exception it is.
+
+## Correctness
+
+`pixi run verify` passes at production scale (D=41, H=W=2048) on the
+gfx1151 box, all six arms on both versions: `max abs diff = 8.583e-06`
+against the numpy reference for every one of them, and the five
+work-mapping arms bit-identical to `base`. That covers the two things this
+session touched -- the warmup path and the new arm.
+
+`t8w8c4Gtw` reports **the same 8.583e-06 / 2.396e-06 / 6.760e-07** as the
+arms that are bit-identical to `base`, to every digit shown, which made the
+carve-out look unnecessary. It is not. Dumped and compared directly:
+
+| `t8w8c4Gtw` vs `base`, v2, full scale | |
+|---|---|
+| bit-identical | **no** |
+| elements differing | 3,665,219 of 171,966,464 (**2.1%**) |
+| max abs difference | **2.861e-06** |
+
+So the table is a genuinely different rounding, the retirement note was
+right, and the carve-out stays. The reason the summary line did not move is
+that 2.86e-06 is a third of the 8.58e-06 the whole pipeline already differs
+from numpy by, so it disappears under it.
+
+**That figure is not new -- it is a reproduction.** The original `tw`
+session recorded "differs by 2.861e-06" for this same arm, to the same four
+digits, on the same GPU. Worth knowing that it reproduced exactly across a
+year of unrelated changes to the pipeline, and worth admitting that
+re-deriving it cost a measurement that reading sec. `tw` would have given
+away. What is new is the 2.1% element count, which is the part that says
+*where* the difference is.
+
+**A prediction of mine that was wrong, recorded because the reasoning looks
+sound and is not.** I expected bit-exactness from the angle algebra: the
+table stores `cos/sin(-2*pi*i/N)` and a stage of length `L` looks up
+`i = k*(N/L)`, and since `N/L` is a power of two, `fl(fl(c*k*s)/(L*s)) ==
+fl(fl(c*k)/L)` -- scaling by a power of two is exact and rounding is
+scale-invariant under it, so both paths should reduce to the same float32.
+That much still holds. What it misses is that only 2.1% of outputs differ,
+which is far too few for the forward twiddles to be involved at all, and
+points instead at the **conjugation**: with the table on, an inverse stage
+reads the stored forward value and negates the imaginary part
+(`(wr, -wi)`); with it off, it evaluates `cos`/`sin` on the *positive*
+angle directly. Those agree only if the underlying `cos`/`sin` are exactly
+even and odd about zero, which is a property of the implementation's
+argument reduction, not of the algebra. That is a hypothesis with the right
+order of magnitude, not a measurement -- it would take a targeted
+`sin(-x) == -sin(x)` kernel to confirm, and nothing downstream depends on
+it.
+
+Either way the timing A/B is unaffected: 2.86e-06 is a rounding difference
+in the twiddles, not a different computation, and the arm measures the
+table's cost.
+
+## What to run, in order
+
+**On the H100 NVL** -- the profile is the whole point and everything else
+is a rider:
+
+```
+cd openflr-mojo
+./profile_card.sh v2 t8w8c4G          # -> <gpu>_v2_t8w8c4G.prof.txt
+./profile_card.sh v1 t8w8c4G          # -> <gpu>_v1_t8w8c4G.prof.txt
+./ncu_card.sh    v2 t8w8c4G           # -> <gpu>_v2_t8w8c4G.ncu.txt
+pixi run mojo run src/main.mojo -- v2 20   # six arms now, incl. t8w8c4Gtw
+pixi run mojo run src/main.mojo -- v1 20
+```
+
+**On the A100** -- same arm, same scripts, because there is no denominator
+for a per-kernel ratio without it and the post-gather A100 breakdown does
+not exist either way (standing item 0):
+
+```
+./profile_card.sh v2 t8w8c4G
+./profile_card.sh v1 t8w8c4G
+pixi run mojo run src/main.mojo -- v2 20
+```
+
+The anchor check applies as always: if `t4w8c4` does not come back at
+0.01360-0.01362 on v2 on the A100, the run is not comparable to anything in
+this file.

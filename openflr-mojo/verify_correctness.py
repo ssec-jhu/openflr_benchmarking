@@ -3,11 +3,13 @@
 
 Two checks per version:
   * every arm agrees with numpy to better than 1e-3;
-  * every arm agrees with `base` **bit-exactly**. They differ only in how
-    work is mapped onto threads and blocks, never in the arithmetic or its
-    order, so any difference at all is a bug. (The retired `tw` arm was the
-    one exception -- a twiddle table is a different rounding of the same
-    quantity -- and it is gone.)
+  * every *work-mapping* arm agrees with `base` **bit-exactly**. Those arms
+    differ only in how work is mapped onto threads and blocks, never in the
+    arithmetic or its order, so any difference at all is a bug.
+    `t8w8c4Gtw` is the one exception and is held to the numpy tolerance
+    only: it reads twiddles from a precomputed shared table instead of
+    calling cos/sin per thread, which is a different rounding of the same
+    quantity, not a different quantity.
 
 Usage (from openflr-mojo/):
     pixi run verify
@@ -44,8 +46,9 @@ def numpy_reference(version: str) -> np.ndarray:
         return run_numpy_v2_step(data, img, psf_fft, psft_fft)
 
 
-ARMS = ("base", "t4w8c4", "t8w8c4G", "t8w8c4Gi8", "t8w16c4G")
-BIT_EXACT = ARMS  # every arm is a pure work-mapping change
+ARMS = ("base", "t4w8c4", "t8w8c4G", "t8w8c4Gi8", "t8w16c4G", "t8w8c4Gtw")
+# Every arm but the twiddle-table one is a pure work-mapping change.
+BIT_EXACT = tuple(a for a in ARMS if not a.endswith("tw"))
 
 
 def mojo_result(version: str, arm: str) -> np.ndarray:
