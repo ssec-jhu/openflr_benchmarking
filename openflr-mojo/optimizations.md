@@ -362,7 +362,9 @@ and occupancy has been ruled out as the variable twice.
 - **`ncu` will appear to hang** unless you constrain it hard. It needs
   `--target-processes all` (otherwise it attaches to `pixi` and waits
   forever for launches that never come), it needs `--launch-count` in the
-  low single digits (these grids are 42k-84k blocks and warp sampling
+  low single digits -- **this was ignored once, at `-c 20`, and cost 20-30
+  minutes of a booked H100; `ncu_card.sh` now uses a `-k` kernel filter and
+  `-c 4`, which is both cheaper and more decisive** -- (these grids are 42k-84k blocks and warp sampling
   overhead scales with warp-cycles; ~33 matching launches x ~10 passes
   runs for over half an hour), and `--set full` is hopeless because kernel
   replay must save and restore the 1.4-2 GB each kernel writes, per pass.
@@ -3524,22 +3526,45 @@ trace it reports 47.6%, which is not dispatch overhead at all but the
 host-side gap between `ctx.synchronize()` and the next launch.
 
 **3. `ncu_card.sh`** -- two `ncu` invocations that resolve *which* per-SM
-resource binds, in the only form this GPU tolerates. Group A settles
-whether the byte model in this file is true (standing item 1: every GB/s
-figure here is *intended* traffic and none has ever been checked against
-`dram__bytes`) and how far from the DRAM roof these kernels are. Group B
-ranks the SM pipes against each other -- shared-memory wavefronts, bank
-conflicts, LSU/FMA/ALU/XU issue, barrier stall -- where XU is the SFU that
-the per-thread twiddle `cos`/`sin` issues on.
+resource binds. Group A settles whether the byte model in this file is true
+(standing item 1: every GB/s figure here is *intended* traffic and none has
+ever been checked against `dram__bytes`) and how far from the DRAM roof
+these kernels are. Group B ranks the SM pipes against each other --
+shared-memory wavefronts, bank conflicts, LSU/FMA/ALU/XU issue, barrier
+stall -- where XU is the SFU that the per-thread twiddle `cos`/`sin`
+issues on.
 
-Two metric groups rather than one set, because kernel replay has to save
-and restore the 1.4-2 GB each of these kernels writes once per pass, so
-pass count is the entire cost; `--set full` is hopeless here for that
-reason. And it skips the **first 9 launches**: `prepare_psf` calls
-`rfft2_batched_gpu_t` three times before any arm runs, at that overload's
-*default* parameters (`TDIV=2, WDIV=4, CG=0`, i.e. `base`), at 3 kernels a
-call. Profile from launch 0 and a third of the report describes the wrong
-configuration -- the same trap as the warmup, one layer down.
+**It profiles four launches, and the sizing is the whole design.** The
+first version of this script asked for 20 and ran for 20-30 minutes, which
+is this file's own trap note being ignored: kernel replay saves and
+restores the 1.4-2 GB each of these kernels writes, once per pass per
+launch, so cost is launches x passes x 2 GB, and the note says
+`--launch-count` has to stay in the low single digits. Four is enough
+because the question is about two *populations*, not about every dispatch --
+so take the two largest FFT kernels and the two kernels closest to the DRAM
+roof:
+
+| kernel | % of iteration | % of peak bw (A100, pre-gather) |
+|---|---|---|
+| `ifft_row_cmul_broadcast_kernel` | 22.4% | 22% |
+| `irfft_row_mul_kernel` | 21.3% | 35% |
+| `complex_mul_kernel` | 8.5% | **87%** |
+| `sum_over_depth_kernel` | 3.2% | **79%** |
+
+If the FFT pair is far from the DRAM roof while the controls sit on it, and
+one SM pipe is pegged on the pair and not on the controls, that pipe is the
+answer. Adding the two forward FFT kernels would confirm rather than
+discriminate.
+
+**The `-k` filter also removes the prep trap for free**, which is why it is
+a filter and not a `--launch-skip`. `prepare_psf` dispatches 9 kernels at
+`base` parameters before any arm runs -- but all 9 are `rfft_row_kernel`,
+`transpose_kernel` and `fft_row_kernel`, and *none of the four kernels
+above is dispatched by the forward transform at all*. So no skip is needed,
+and none of the `--launch-skip` semantics that vary between ncu versions is
+being relied on. Widen the regex to include `fft_row_kernel` or
+`rfft_row_kernel` and the prep launches come back; add `-s 9` by hand if
+you do.
 
 **4. The `t8w8c4Gtw` arm** -- the retired twiddle table, un-retired,
 because the fingerprint changes its terms. `tw` lost 6-11% on the A100:
@@ -3633,7 +3658,7 @@ is a rider:
 cd openflr-mojo
 ./profile_card.sh v2 t8w8c4G          # -> <gpu>_v2_t8w8c4G.prof.txt
 ./profile_card.sh v1 t8w8c4G          # -> <gpu>_v1_t8w8c4G.prof.txt
-./ncu_card.sh    v2 t8w8c4G           # -> <gpu>_v2_t8w8c4G.ncu.txt
+./ncu_card.sh    v2 t8w8c4G           # -> <gpu>_v2_t8w8c4G.ncu.txt (4 launches)
 pixi run mojo run src/main.mojo -- v2 20   # six arms now, incl. t8w8c4Gtw
 pixi run mojo run src/main.mojo -- v1 20
 ```
