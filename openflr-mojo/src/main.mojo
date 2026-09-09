@@ -156,8 +156,8 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif (a == "base" or a == "t4w8" or a == "t4w8c4"
-              or a == "t8w8c4" or a == "t4w8c4g"):
+        elif (a == "base" or a == "t4w8c4" or a == "t4w8c4g"
+              or a == "t4w8c4G" or a == "t8w8c4G"):
             arm = a
         else:
             n_iters = Int(a)
@@ -261,17 +261,18 @@ def main() raises:
 
     comptime for arm_i in range(5):
         comptime TW = False
-        comptime TDIV = 2 if arm_i == 0 else (8 if arm_i == 3 else 4)
+        comptime TDIV = 2 if arm_i == 0 else (8 if arm_i == 4 else 4)
         comptime WDIV = 4 if arm_i == 0 else 8
-        comptime CDIV = 4 if arm_i >= 2 else 2
-        # Pinned to 4 on the `t8w8c4` arm so `TDIV` moves `fft_row_kernel`
+        comptime CDIV = 4 if arm_i >= 1 else 2
+        # Pinned to 4 on the `t8w8c4G` arm so `TDIV` moves `fft_row_kernel`
         # and nothing else; everywhere else it tracks `TDIV`, as it always
         # did.
-        comptime IDIV = 4 if arm_i == 3 else TDIV
-        comptime CG = arm_i == 4
-        comptime arm_name = "t4w8" if arm_i == 1 else (
-            "t4w8c4" if arm_i == 2 else ("t8w8c4" if arm_i == 3 else (
-                "t4w8c4g" if arm_i == 4 else "base")))
+        comptime IDIV = 4 if arm_i == 4 else TDIV
+        # 0 = off, 1 = `fft_row_kernel` only, 2 = every row-FFT kernel.
+        comptime CG = 2 if arm_i >= 3 else (1 if arm_i == 2 else 0)
+        comptime arm_name = "t4w8c4" if arm_i == 1 else (
+            "t4w8c4g" if arm_i == 2 else ("t4w8c4G" if arm_i == 3 else (
+                "t8w8c4G" if arm_i == 4 else "base")))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":

@@ -157,7 +157,7 @@ def twiddle[N: Int, L: Int, TW: Bool, invert: Bool](
         return SIMD[DType.float32, 2](cos(angle), sin(angle))
 
 
-def lds_swizzle(i: Int) -> Int:
+def lds_swizzle[N: Int](i: Int) -> Int:
     """Index swizzle for the shared-memory buffer that
     `fft_row_cmul_ifft_kernel` hands from its forward pass to its inverse
     pass.
@@ -172,8 +172,18 @@ def lds_swizzle(i: Int) -> Int:
     bank `rev5(w) ^ rev5(l)`, which is distinct for every lane. The
     permutation is an involution and a bijection within each 32-element
     aligned block, so it is a pure relabelling of shared memory: nothing
-    about the arithmetic changes. For `N < 64` it is the identity."""
-    return i ^ ((i >> 6) & 31)
+    about the arithmetic changes. For `N < 64` it is the identity.
+
+    The shift is `log2(N) - 5`, not a constant 6: it has to match the stride
+    the bit-reversed index runs at, which is `N/32` elements. At `N = 2048`
+    that is 6 -- the value this was written with, and the only one it had
+    while `fft_row_cmul_ifft_kernel` was its sole user. The real-input
+    kernels drive a length-`N/2` transform, where the stride is halved and a
+    shift of 6 would leave a 2-way bank conflict instead of none."""
+    comptime if N < 64:
+        return i
+    comptime shift = ilog2_ct(N) - 5
+    return i ^ ((i >> shift) & 31)
 
 
 def fft_warp_head[N: Int, invert: Bool, TW: Bool](
@@ -484,8 +494,8 @@ def fft_lds_head[
     var gb_im = SIMD[DType.float32, heads](0)
     comptime for h in range(heads):
         var blk = warp + h * num_warps
-        var sa = lds_swizzle(64 * blk + lane)
-        var sb = lds_swizzle(64 * blk + lane + 32)
+        var sa = lds_swizzle[N](64 * blk + lane)
+        var sb = lds_swizzle[N](64 * blk + lane + 32)
         ga_re[h] = rebind[Scalar[DType.float32]](s_re[sa])
         ga_im[h] = rebind[Scalar[DType.float32]](s_im[sa])
         gb_re[h] = rebind[Scalar[DType.float32]](s_re[sb])
@@ -558,7 +568,7 @@ def fft_row_kernel[
         # `fft_lds_head` expects to find it.
         comptime for e in range(elems):
             var n_ = tid + e * THREADS
-            var dst = lds_swizzle(bit_reverse_ct(n_, log2n))
+            var dst = lds_swizzle[N](bit_reverse_ct(n_, log2n))
             s_re[dst] = rebind[Scalar[DType.float32]](re[row, n_])
             s_im[dst] = rebind[Scalar[DType.float32]](im[row, n_])
 
@@ -732,8 +742,8 @@ def fft_row_cmul_ifft_kernel[
                     var pos_a = 64 * blk + lane
                     var src_a = bit_reverse_ct(pos_a, log2n)
                     var src_b = bit_reverse_ct(pos_a + 32, log2n)
-                    var sa = lds_swizzle(src_a)
-                    var sb = lds_swizzle(src_b)
+                    var sa = lds_swizzle[N](src_a)
+                    var sb = lds_swizzle[N](src_b)
                     ga_re[h] = rebind[Scalar[DType.float32]](s_re[sa])
                     ga_im[h] = rebind[Scalar[DType.float32]](s_im[sa])
                     gb_re[h] = rebind[Scalar[DType.float32]](s_re[sb])
@@ -770,8 +780,8 @@ def fft_row_cmul_ifft_kernel[
                 var vi = SIMD[DType.float32, elems](0)
                 comptime for e in range(elems):
                     var src = bit_reverse_ct(tid + e * THREADS, log2n)
-                    vr[e] = rebind[Scalar[DType.float32]](s_re[lds_swizzle(src)])
-                    vi[e] = rebind[Scalar[DType.float32]](s_im[lds_swizzle(src)])
+                    vr[e] = rebind[Scalar[DType.float32]](s_re[lds_swizzle[N](src)])
+                    vi[e] = rebind[Scalar[DType.float32]](s_im[lds_swizzle[N](src)])
                 barrier()
                 comptime for e in range(elems):
                     var dst = tid + e * THREADS
@@ -799,7 +809,7 @@ def fft_row_cmul_ifft_kernel[
                 var o = tid + e * THREADS
                 var pr = rebind[Scalar[DType.float32]](p_re[row, o])
                 var pi = rebind[Scalar[DType.float32]](p_im[row, o])
-                var d = lds_swizzle(o)
+                var d = lds_swizzle[N](o)
                 s_re[d] = xr[e] * pr - xi[e] * pi
                 s_im[d] = xr[e] * pi + xi[e] * pr
             barrier()
@@ -814,7 +824,7 @@ def fft_row_cmul_ifft_kernel[
 def ifft_row_cmul_broadcast_kernel[
     N: Int, D: Int, W2: Int,
     BLT: TensorLayout, ALT: TensorLayout, OLT: TensorLayout,
-    TW: Bool = False, THREADS: Int = N // 2,
+    TW: Bool = False, THREADS: Int = N // 2, CG: Bool = False,
 ](
     b_re: TileTensor[DType.float32, BLT, MutAnyOrigin],  # (D*W2, N)
     b_im: TileTensor[DType.float32, BLT, MutAnyOrigin],
@@ -881,7 +891,23 @@ def ifft_row_cmul_broadcast_kernel[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    comptime if N >= 64 and WARP_SIZE == 32:
+    comptime if N >= 64 and WARP_SIZE == 32 and CG:
+        # Coalesced reads of both operands, multiply, then bit-reversed
+        # scatter into shared memory. See `fft_lds_head`.
+        comptime for e in range(elems):
+            var n_ = tid + e * THREADS
+            var xar = rebind[Scalar[DType.float32]](a_re[w, n_])
+            var xai = rebind[Scalar[DType.float32]](a_im[w, n_])
+            var xbr = rebind[Scalar[DType.float32]](b_re[brow, n_])
+            var xbi = rebind[Scalar[DType.float32]](b_im[brow, n_])
+            var dst = lds_swizzle[N](bit_reverse_ct(n_, log2n))
+            s_re[dst] = xar * xbr - xai * xbi
+            s_im[dst] = xar * xbi + xai * xbr
+
+        fft_lds_head[N, True, TW, THREADS](t_re, t_im, s_re, s_im, tid)
+
+        fft_lds_stages[N, 6, True, TW, THREADS](t_re, t_im, s_re, s_im, tid)
+    elif N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
         # One head block at a time; see `fft_row_kernel` for why this is a
@@ -941,7 +967,7 @@ def ifft_row_cmul_broadcast_kernel[
 
 def rfft_row_kernel[
     N: Int, LT: TensorLayout, OutLT: TensorLayout, TW: Bool = False,
-    THREADS: Int = N // 4,
+    THREADS: Int = N // 4, CG: Bool = False,
 ](
     x: TileTensor[DType.float32, LT, MutAnyOrigin],
     out_re: TileTensor[DType.float32, OutLT, MutAnyOrigin],
@@ -984,7 +1010,20 @@ def rfft_row_kernel[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    comptime if half >= 64 and WARP_SIZE == 32:
+    comptime if half >= 64 and WARP_SIZE == 32 and CG:
+        # Coalesced read and pack, then a bit-reversed scatter into shared
+        # memory over the *internal* length-`half` transform. See
+        # `fft_lds_head`.
+        comptime for e in range(elems):
+            var n_ = tid + e * THREADS
+            var dst = lds_swizzle[half](bit_reverse_ct(n_, log2h))
+            s_re[dst] = rebind[Scalar[DType.float32]](x[row, 2 * n_])
+            s_im[dst] = rebind[Scalar[DType.float32]](x[row, 2 * n_ + 1])
+
+        fft_lds_head[half, False, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+
+        fft_lds_stages[half, 6, False, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+    elif half >= 64 and WARP_SIZE == 32:
         # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
         # for the index-algebra proof and for why the head blocks are taken
         # one at a time, strided by `num_warps`), applied to this kernel's
@@ -1050,7 +1089,7 @@ def rfft_row_kernel[
 
 def rfft_row_kernel_div[
     N: Int, LT: TensorLayout, OutLT: TensorLayout, TW: Bool = False,
-    THREADS: Int = N // 4,
+    THREADS: Int = N // 4, CG: Bool = False,
 ](
     a: TileTensor[DType.float32, LT, MutAnyOrigin],
     b: TileTensor[DType.float32, LT, MutAnyOrigin],
@@ -1084,7 +1123,19 @@ def rfft_row_kernel_div[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    comptime if half >= 64 and WARP_SIZE == 32:
+    comptime if half >= 64 and WARP_SIZE == 32 and CG:
+        # Coalesced read, divide and pack, then a bit-reversed scatter into
+        # shared memory. See `fft_lds_head`.
+        comptime for e in range(elems):
+            var n_ = tid + e * THREADS
+            var dst = lds_swizzle[half](bit_reverse_ct(n_, log2h))
+            s_re[dst] = rebind[Scalar[DType.float32]](a[row, 2 * n_]) / rebind[Scalar[DType.float32]](b[row, 2 * n_])
+            s_im[dst] = rebind[Scalar[DType.float32]](a[row, 2 * n_ + 1]) / rebind[Scalar[DType.float32]](b[row, 2 * n_ + 1])
+
+        fft_lds_head[half, False, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+
+        fft_lds_stages[half, 6, False, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+    elif half >= 64 and WARP_SIZE == 32:
         # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
         # for the index-algebra proof), applied to this kernel's internal
         # length-`half` complex FFT of `a / b`.
@@ -1148,7 +1199,8 @@ def rfft_row_kernel_div[
 
 
 def irfft_row_into_lds[
-    N: Int, TW: Bool, InLT: TensorLayout, THREADS: Int = N // 4
+    N: Int, TW: Bool, InLT: TensorLayout, THREADS: Int = N // 4,
+    CG: Bool = False,
 ](
     t_re: TileTensor[
         DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
@@ -1194,7 +1246,37 @@ def irfft_row_into_lds[
     comptime elems = half // THREADS
     comptime assert (half // 2) % THREADS == 0, "THREADS must divide N/4"
 
-    comptime if half >= 64 and WARP_SIZE == 32:
+    comptime if half >= 64 and WARP_SIZE == 32 and CG:
+        # Coalesced reconstruct, then the bit-reversed scatter into shared
+        # memory that this kernel's slow path already used -- the fast path
+        # differs from it only in following up with `fft_lds_head`. Reading
+        # `in_*[row, half - k]` for a warp's consecutive `k` is a contiguous
+        # run in reverse order, which coalesces exactly as well as a forward
+        # one.
+        comptime for e in range(elems):
+            var k = tid + e * THREADS
+            var idx = half - k
+            var ar = rebind[Scalar[DType.float32]](in_re[row, k])
+            var ai = rebind[Scalar[DType.float32]](in_im[row, k])
+            var br = rebind[Scalar[DType.float32]](in_re[row, idx])
+            var bi = -rebind[Scalar[DType.float32]](in_im[row, idx])
+            var er = (ar + br) * 0.5
+            var ei = (ai + bi) * 0.5
+            var dr = (ar - br) * 0.5
+            var di = (ai - bi) * 0.5
+            var angle_tw = twiddle[N, N, TW, True](t_re, t_im, k)
+            var wr = angle_tw[0]
+            var wi = angle_tw[1]
+            var or_ = dr * wr - di * wi
+            var oi_ = dr * wi + di * wr
+            var dst = lds_swizzle[half](bit_reverse_ct(k, log2h))
+            s_re[dst] = er - oi_
+            s_im[dst] = ei + or_
+
+        fft_lds_head[half, True, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+
+        fft_lds_stages[half, 6, True, TW, THREADS, N](t_re, t_im, s_re, s_im, tid)
+    elif half >= 64 and WARP_SIZE == 32:
         # Same warp-shuffle fast path as `fft_row_kernel` (see its comment
         # for the index-algebra proof). The "reconstruct" step below is a
         # scatter (source index `k`, destination `bit_reverse(k)`) rather
@@ -1284,7 +1366,7 @@ def irfft_row_into_lds[
 
 def irfft_row_kernel[
     N: Int, InLT: TensorLayout, LT: TensorLayout, TW: Bool = False,
-    THREADS: Int = N // 4,
+    THREADS: Int = N // 4, CG: Bool = False,
 ](
     in_re: TileTensor[DType.float32, InLT, MutAnyOrigin],
     in_im: TileTensor[DType.float32, InLT, MutAnyOrigin],
@@ -1309,7 +1391,7 @@ def irfft_row_kernel[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    irfft_row_into_lds[N, TW, InLT, THREADS](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
+    irfft_row_into_lds[N, TW, InLT, THREADS, CG](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
 
     comptime inv_half: Float32 = 1.0 / Float32(half)
     for i in range(elems):
@@ -1320,7 +1402,7 @@ def irfft_row_kernel[
 
 def irfft_row_mul_kernel[
     N: Int, SHIFT: Bool, H: Int, InLT: TensorLayout, LT: TensorLayout,
-    TW: Bool = False, THREADS: Int = N // 4,
+    TW: Bool = False, THREADS: Int = N // 4, CG: Bool = False,
 ](
     in_re: TileTensor[DType.float32, InLT, MutAnyOrigin],
     in_im: TileTensor[DType.float32, InLT, MutAnyOrigin],
@@ -1362,7 +1444,7 @@ def irfft_row_mul_kernel[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    irfft_row_into_lds[N, TW, InLT, THREADS](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
+    irfft_row_into_lds[N, TW, InLT, THREADS, CG](t_re, t_im, in_re, in_im, s_re, s_im, row, tid)
 
     var out_row: Int
     comptime if SHIFT:
@@ -1923,7 +2005,8 @@ def irfft2_batched_gpu_cmul_broadcast[
 
 
 def rfft_w_div_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4,
+    CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -1943,7 +2026,7 @@ def rfft_w_div_transposed_gpu[
     comptime in_row_layout = row_major[D * H, W]()
     comptime out_row_layout = row_major[D * H, W2]()
     comptime WT = W // WDIV
-    comptime kernel_w = rfft_row_kernel_div[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT]
+    comptime kernel_w = rfft_row_kernel_div[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT, CG >= 2]
     ctx.enqueue_function[kernel_w](
         TileTensor(a_buf, in_row_layout), TileTensor(b_buf, in_row_layout),
         TileTensor(t_re, out_row_layout), TileTensor(t_im, out_row_layout),
@@ -1963,7 +2046,7 @@ def rfft_w_div_transposed_gpu[
 
 def rfft2_batched_gpu_div_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4, CG: Bool = False,
+    WDIV: Int = 4, CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -1979,11 +2062,11 @@ def rfft2_batched_gpu_div_t[
     consumer, `irfft2_batched_gpu_cmul_broadcast_t`, wants the transposed
     layout, so the final transpose is pure waste."""
     comptime W2 = W // 2 + 1
-    rfft_w_div_transposed_gpu[D, H, W, TILE, TW, WDIV](ctx, a_buf, b_buf, out_re, out_im, t_re, t_im)
+    rfft_w_div_transposed_gpu[D, H, W, TILE, TW, WDIV, CG](ctx, a_buf, b_buf, out_re, out_im, t_re, t_im)
 
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG >= 1]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,
@@ -1992,7 +2075,7 @@ def rfft2_batched_gpu_div_t[
 
 def irfft2_batched_gpu_cmul_broadcast_mul_t[
     D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool, TW: Bool = False,
-    TDIV: Int = 2, WDIV: Int = 4, IDIV: Int = TDIV,
+    TDIV: Int = 2, WDIV: Int = 4, IDIV: Int = TDIV, CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut a_re: DeviceBuffer[DType.float32],  # (W/2+1, H), broadcast over depth
@@ -2041,7 +2124,7 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     # which is exactly the old behaviour.
     comptime HI = H // IDIV
     comptime kernel_h = ifft_row_cmul_broadcast_kernel[
-        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW, HI
+        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW, HI, CG >= 2
     ]
     ctx.enqueue_function[kernel_h](
         TileTensor(b_re, b_row_layout), TileTensor(b_im, b_row_layout),
@@ -2064,7 +2147,7 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     comptime out_row_layout = row_major[D * H, W]()
     comptime WT = W // WDIV
     comptime kernel_w = irfft_row_mul_kernel[
-        W, SHIFT, H, type_of(in_row_layout), type_of(out_row_layout), TW, WT
+        W, SHIFT, H, type_of(in_row_layout), type_of(out_row_layout), TW, WT, CG >= 2
     ]
     ctx.enqueue_function[kernel_w](
         TileTensor(scratch_re, in_row_layout), TileTensor(scratch_im, in_row_layout),
@@ -2074,7 +2157,8 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
 
 
 def rfft_w_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4,
+    CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2094,7 +2178,7 @@ def rfft_w_transposed_gpu[
     var re_rows = TileTensor(t_re, out_row_layout)
     var im_rows = TileTensor(t_im, out_row_layout)
     comptime WT = W // WDIV
-    comptime kernel_w = rfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT]
+    comptime kernel_w = rfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT, CG >= 2]
     ctx.enqueue_function[kernel_w](x_rows, re_rows, im_rows, grid_dim=D * H, block_dim=WT)
 
     comptime in_layout_a = row_major[D, H, W2]()
@@ -2109,7 +2193,8 @@ def rfft_w_transposed_gpu[
 
 
 def irfft_w_from_transposed_gpu[
-    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4
+    D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, WDIV: Int = 4,
+    CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2135,7 +2220,7 @@ def irfft_w_from_transposed_gpu[
     comptime in_row_layout = row_major[D * H, W2]()
     comptime out_row_layout = row_major[D * H, W]()
     comptime WT = W // WDIV
-    comptime kernel_w = irfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT]
+    comptime kernel_w = irfft_row_kernel[W, type_of(in_row_layout), type_of(out_row_layout), TW, WT, CG >= 2]
     ctx.enqueue_function[kernel_w](
         TileTensor(t_re, in_row_layout), TileTensor(t_im, in_row_layout),
         TileTensor(out_x, out_row_layout),
@@ -2173,7 +2258,7 @@ def fft_col_cmul_ifft_gpu[
 
 def rfft2_batched_gpu_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4, CG: Bool = False,
+    WDIV: Int = 4, CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2189,11 +2274,11 @@ def rfft2_batched_gpu_t[
     round-trip transpose pair that used to sit across every
     `rfft2 -> elementwise -> irfft2` boundary."""
     comptime W2 = W // 2 + 1
-    rfft_w_transposed_gpu[D, H, W, TILE, TW, WDIV](ctx, x_buf, out_re, out_im, t_re, t_im)
+    rfft_w_transposed_gpu[D, H, W, TILE, TW, WDIV, CG](ctx, x_buf, out_re, out_im, t_re, t_im)
 
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG >= 1]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,
@@ -2202,7 +2287,7 @@ def rfft2_batched_gpu_t[
 
 def irfft2_batched_gpu_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4, CG: Bool = False,
+    WDIV: Int = 4, CG: Int = 0,
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2217,10 +2302,10 @@ def irfft2_batched_gpu_t[
     comptime W2 = W // 2 + 1
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW, HT, CG]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW, HT, CG >= 1]
     ctx.enqueue_function[kernel_h](
         TileTensor(in_re, row_layout_h), TileTensor(in_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,
     )
 
-    irfft_w_from_transposed_gpu[D, H, W, TILE, TW, WDIV](ctx, in_re, in_im, out_x, t_re, t_im)
+    irfft_w_from_transposed_gpu[D, H, W, TILE, TW, WDIV, CG](ctx, in_re, in_im, out_x, t_re, t_im)
