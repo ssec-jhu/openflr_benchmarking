@@ -44,7 +44,7 @@ def numpy_reference(version: str) -> np.ndarray:
         return run_numpy_v2_step(data, img, psf_fft, psft_fft)
 
 
-ARMS = ("base", "t4", "t4w8", "t4w8c4")
+ARMS = ("base", "t4w8", "t4w8c4", "t4w8c4i8")
 BIT_EXACT = ARMS  # every arm is a pure work-mapping change
 
 
@@ -68,7 +68,7 @@ def main() -> None:
             diff = np.abs(expected - actual)
             rel = diff / (np.abs(expected) + 1e-8)
             print(
-                f"{version} {arm:<6}: max abs diff = {diff.max():.3e}, "
+                f"{version} {arm:<8}: max abs diff = {diff.max():.3e}, "
                 f"mean abs diff = {diff.mean():.3e}, max rel diff = {rel.max():.3e}"
             )
             assert diff.max() < 1e-3, f"{version} {arm} mismatch too large"

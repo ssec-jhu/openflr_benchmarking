@@ -14,26 +14,35 @@ hardware has.
 
 ## Where things stand
 
-The target is the A100-SXM4-80GB. Best measured configuration is the `t4w8`
-arm:
+The target is the A100-SXM4-80GB. Best measured configuration is the
+`t4w8c4` arm:
 
-| | mojo `t4w8` | jax | gap |
-|---|---|---|---|
-| v1 | 0.018435 s | 0.017216 s | **+7.1%** |
-| v2 | 0.013598 s | 0.011200 s | **+21.4%** |
+| | mojo `t4w8c4` | jax | torch | gap to jax |
+|---|---|---|---|---|
+| v1 | 0.017543 s | 0.017216 s | 0.0196 s | **+1.90%** |
+| v2 | 0.013594 s | 0.011200 s | 0.0112 s | **+21.4%** |
 
-v1 began this effort 20.5% behind JAX. `../results.md` still carries the
-`t4` numbers. On the gfx1151 iGPU the same code beats ROCm JAX by 1.8x and
-ROCm torch by 3.9x, so the kernels are not weak in general -- the remaining
-gap is A100-specific tuning.
+v1 began this effort 20.5% behind JAX and is now within 2% of it, ahead of
+torch, and **effectively done**. v2 is the whole remaining problem: it does
+not dispatch the kernel that produced v1's last and largest increment, and
+its gap has barely moved. Published in `../results.md`. On the gfx1151 iGPU
+the same code beats ROCm JAX by 1.8x and ROCm torch by 3.9x, so the kernels
+are not weak in general -- the remaining gap is A100-specific tuning.
 
-**The occupancy lever is close to exhausted.** Three block-size changes have
-now been measured and the pattern is clear: 1024 -> 512 threads pays a lot
-(6.8% of v2), 512 -> 256 pays 1%, 256 -> 128 pays nothing. Only one kernel
-is still at 1024 (`fft_row_cmul_ifft_kernel`, v1 only) and the `t4w8c4` arm
-is that change, awaiting measurement. After it, block size is done -- see
-the `w8` session for the bandwidth-percentage rule that predicts which
-kernels respond.
+**The block-size lever is spent, and it has a rule.** Four changes measured:
+
+| step | measured |
+|---|---|
+| 1024 -> 512 threads (three kernels, two sessions) | **-5 to -7%** each time |
+| 512 -> 256 threads (four width kernels) | -1.0% |
+| 256 -> 128 threads (same four) | +0.2 to +0.9% |
+
+The first halving is the only one that escapes the per-SM *thread* ceiling
+(at 1024 threads a block gets 2/SM by that limit alone, whatever its
+register count); everything past it is register-bound, and these kernels'
+registers grow as fast as the block shrinks. **No kernel in either pipeline
+launches 1024 threads any more.** The one untested corner is a single
+kernel, and the `t4w8c4i8` arm is it -- see item 0 below.
 
 ## The one thing to internalise before optimising anything
 
@@ -76,44 +85,51 @@ pixi run test                                   # unit tests
 The four arms, selected by compile-time parameters threaded from
 `main.mojo` down to the kernels:
 
-| arm | `TDIV` | `WDIV` | `CDIV` | what it is |
-|---|---|---|---|---|
-| `base` | 2 | 4 | 2 | bit-identical to commit `9da8abd`, before any of this |
-| `t4` | 4 | 4 | 2 | 512-thread column-FFT blocks |
-| `t4w8` | 4 | 8 | 2 | + 256-thread width blocks -- **best measured** |
-| `t4w8c4` | 4 | 8 | 4 | + 512-thread `fft_row_cmul_ifft` -- **awaiting A100** |
+| arm | `TDIV` | `WDIV` | `CDIV` | `IDIV` | what it is |
+|---|---|---|---|---|---|
+| `base` | 2 | 4 | 2 | 2 | bit-identical to commit `9da8abd`, before any of this |
+| `t4w8` | 4 | 8 | 2 | 4 | superseded, kept as the **cross-run anchor** |
+| `t4w8c4` | 4 | 8 | 4 | 4 | + 512-thread `fft_row_cmul_ifft` -- **best measured** |
+| `t4w8c4i8` | 4 | 8 | 4 | **8** | + 256-thread `ifft_row_cmul_broadcast` -- **awaiting A100** |
 
-`TDIV` sizes the two column-FFT kernels' blocks at `H/TDIV`, `WDIV` the four
-width-axis kernels' at `W/WDIV`, `CDIV` the fused forward-multiply-inverse
-column kernel's at `H/CDIV`. All four arms are bit-identical to each other by
-construction and `pixi run verify` asserts it: they only remap work across
-threads. Keep that invariant -- it is what makes an A/B trustworthy.
+The knobs set block sizes: `TDIV` gives `fft_row_kernel` `H/TDIV` threads,
+`WDIV` the four width-axis kernels `W/WDIV`, `CDIV` the fused
+forward-multiply-inverse column kernel `H/CDIV`, `IDIV`
+`ifft_row_cmul_broadcast_kernel` `H/IDIV`. All four arms are bit-identical to
+each other by construction and `pixi run verify` asserts it: they only remap
+work across threads. Keep that invariant -- it is what makes an A/B
+trustworthy.
 
-`CDIV` affects v1 only, so on **v2 `t4w8c4` is a duplicate of `t4w8`** and
-doubles as a within-run reproducibility control: if those two disagree by
-more than ~0.1%, the run hit a clock step and nothing else in it is
-trustworthy either.
+Two of the arms earn their slot as controls rather than as candidates:
+
+- **`t4w8` is the cross-run anchor.** It has been measured on two separate
+  runs and reproduced to 0.12% (v1) and 0.03% (v2). If it moves more than
+  that, the new run is not comparable to the numbers in this file.
+- **`t4w8c4` is a within-run control on v2**, where `CDIV` changes nothing,
+  so it must land within ~0.1% of `t4w8`. It did (+0.088%). If it does not,
+  the run hit a clock step and nothing else in it is trustworthy either.
 
 Three arms were retired after being measured and losing: `tw` (a shared
-twiddle table, sec. `tw`), `t8` (256-thread *column* blocks) and `t4w16`
-(128-thread width blocks).
+twiddle table, sec. `tw`), `t8` (both column kernels at 256 threads) and
+`t4w16` (128-thread width blocks).
 
 ## What must be done, in order
 
-**0. Measure `t4w8c4` against `t4w8` on v1.** The last `# Session:` heading
-is written, verified and bit-exact but has only been run on the iGPU, which
-cannot screen A100 candidates. `pixi run mojo run src/main.mojo -- v1 20`
-prints all four arms from one process.
+**0. Measure `t4w8c4i8` against `t4w8c4`.** Written, verified and bit-exact,
+run only on the iGPU, which cannot screen A100 candidates. It is the last
+block-size question and it affects **both** versions -- see the `i8` session
+for why `t8`'s 2.7% loss may have been a win and a larger loss added
+together. `pixi run mojo run src/main.mojo -- v2 20`.
 
-**1. Re-profile v2.** The top item regardless of how `c4` lands, and it
-should come before any further kernel work: v2 is +21.4% against JAX and its
-time has not been attributed since before `t4`, two block-size changes ago.
-The `nsys` recipe and its three failure modes are in the traps list below;
-`registersPerThread` comes with it for free and would settle whether
-`t4w8`'s predicted 4 -> 6 blocks/SM ever happened.
+**1. Re-profile v2.** Do this before any further kernel work, whichever way
+item 0 lands: v2 is +21.4% against JAX and its time has not been attributed
+since before `t4`, three block-size changes ago. The `nsys` recipe and its
+three failure modes are in the traps list below; `registersPerThread` comes
+with it for free and would settle whether `t4w8`'s predicted 4 -> 6
+blocks/SM ever happened -- the loose end from that session.
 
 **2. Structural work on the FFT kernels, chosen from that profile.** They
-are 79% of the A100 iteration at 16-29% of peak bandwidth. The untried
+are ~75% of the v2 A100 iteration at 16-29% of peak bandwidth. The untried
 levers are shared-memory traffic and barriers per row -- radix-8 fused
 stages, or holding more of the transform in registers across stages -- not
 block size, which is spent.
@@ -2615,7 +2631,8 @@ correctness.
 
 # Session: `c4` — the last kernel still at `N/2`
 
-**Code landed, verified, bit-exact; A100 measurement outstanding.**
+**Measured on the A100: -4.95% on v1.** The largest single increment of this
+whole effort, and it takes v1 from +7.1% against JAX to **+1.90%**.
 
 ## Why this one and not something else
 
@@ -2688,37 +2705,127 @@ gfx1151 iGPU, v1, 12 iterations: `t4w8` 0.075218, `t4w8c4` 0.074801 --
 why this machine cannot screen A100 candidates); it is here to say the
 restructuring did not cost anything gross.
 
-## What to run
+## Measured on the A100 (ga132, 20 iterations, one process)
+
+| | base | t4 | t4w8 | **t4w8c4** |
+|---|---|---|---|---|
+| v1 | 0.019110 | 0.018648 | 0.018457 | **0.017543** |
+| v2 | 0.014730 | 0.013730 | 0.013594 | 0.013606 |
+
+**v1: -4.95% against `t4w8`, -8.20% against `base`.** Bigger than `t4`
+(-2.5% on v1) and `t4w8` (-1.0%) put together, from one kernel.
+
+The control worked: on v2, where this kernel is never dispatched, `t4w8c4`
+and `t4w8` land 0.088% apart -- inside the 0.1% the arm was added to police,
+so the v1 comparison beside it is sound. `t4w8` itself reproduced to 0.12%
+(v1) and 0.03% (v2) against the previous session's run on the same node.
+
+### The rule from the `w8` session held, and it is the one to keep
+
+Two sessions of block-size work now say the same thing, and it is not "more
+occupancy is better":
+
+| step | measured |
+|---|---|
+| 1024 -> 512 threads, `fft_row_kernel` + `ifft_row_cmul_broadcast` | **-6.8% of v2** |
+| 1024 -> 512 threads, `fft_row_cmul_ifft_kernel` | **-4.95% of v1** |
+| 512 -> 256 threads, the four width kernels | -1.0% |
+| 256 -> 128 threads, the four width kernels | +0.2 to +0.9% |
+
+**1024 -> 512 is worth 5-7% every time it has been available; 512 -> 256 is
+worth ~1%; below that it costs.** The mechanism is the per-SM thread ceiling:
+at 1024 threads a block gets 2/SM by that limit alone, no matter how few
+registers it uses, and the first halving is the only one that escapes it.
+Everything past that is bounded by registers instead, and these kernels'
+register counts rise as fast as the block shrinks.
+
+That step is now spent: **no kernel in either pipeline launches 1024 threads
+any more.**
+
+### The second shared buffer was the wrong instinct, and cheaply so
+
+Worth naming because the previous session's plan would have worked but cost
+16 KB of shared memory for nothing. The hazard is real -- two places read a
+shared buffer they then permute in place -- but the fix is register-side,
+and the cheapest part of it was noticing that the multiply's `p` operands
+live in *global* memory. A `barrier()` orders shared memory; it says nothing
+about global. Moving those four loads from before the barrier to after it
+halves the live set across it at zero cost and in bit-identical arithmetic.
+Look for that whenever a barrier seems to force something into registers.
+
+## Standing after this
+
+| | mojo `t4w8c4` | jax | torch | gap to jax |
+|---|---|---|---|---|
+| v1 | 0.017543 s | 0.017216 s | 0.0196 s | **+1.90%** |
+| v2 | 0.013594 s | 0.011200 s | 0.0112 s | **+21.4%** |
+
+v1 began this effort 20.5% behind JAX and is now within 2%, and comfortably
+ahead of torch. **v1 is close to done; v2 is the whole remaining problem**
+-- and v2 gained nothing here, because it does not dispatch this kernel.
+
+---
+
+# Session: `i8` — splitting the knob that `t8` conflated
+
+**Code landed, verified, bit-exact; A100 measurement outstanding.** Small
+change, and the last block-size question there is.
+
+## The claim
+
+`t8` moved *both* column kernels from 512 to 256 threads at once and lost
+2.7% (v2) / 3.0% (v1). That was read as "512 is the turning point" and the
+step was abandoned. But `TDIV` sized two kernels with one number, and the
+`w8` session then found the rule that says those two kernels want different
+answers:
+
+| kernel | % of peak DRAM bw | response to a smaller block |
+|---|---|---|
+| `ifft_row_cmul_broadcast_kernel` | 16% (18% after `t4`) | -14.0% at `t4` |
+| `fft_row_kernel` | 22% (27% after `t4`) | -17.0% at `t4` |
+
+`t4` moved both off the 1024-thread ceiling and both gained. But it also
+moved them apart: `fft_row_kernel` is now at 27% of peak, over the ~25% line
+where a smaller block has stopped paying in every measurement so far, while
+`ifft_row_cmul_broadcast_kernel` is still at ~18%, the most latency-bound
+kernel in the pipeline. **`t8`'s 2.7% may therefore be a win on one and a
+larger loss on the other, added together and reported as one number.**
+
+That is a cheap thing to find out and it has not been tried. `IDIV` (default
+`TDIV`, i.e. exactly the old behaviour) gives
+`ifft_row_cmul_broadcast_kernel` its own block size; the `t4w8c4i8` arm sets
+it to 8, i.e. 256 threads for that kernel alone and 512 for
+`fft_row_kernel`.
+
+**This one affects both versions**, unlike `c4`. It is the largest single
+dispatch in v2 (4376 us of 17558 before `t4`, ~3772 after).
+
+## Verified
+
+`pixi run test` passes; `pixi run verify` at full scale has all four arms
+bit-identical to `base` on both versions.
+
+## How to read the result
 
 ```
-pixi run mojo run src/main.mojo -- v1 20
 pixi run mojo run src/main.mojo -- v2 20
+pixi run mojo run src/main.mojo -- v1 20
 ```
 
-Read `t4w8c4` against `t4w8` **on v1**; check the two v2 numbers agree
-first. If v1 improves by more than ~2% this was the right call, and the
-`t4` result generalises: 1024 -> 512 is the step that pays, 512 -> 256 is
-mostly spent.
+Check `t4w8` against this file's 0.018457 (v1) / 0.013594 (v2) first -- that
+is the cross-run anchor, and it has held to 0.12% / 0.03% across two runs.
+Then read `t4w8c4i8` against `t4w8c4`.
 
-If it is flat, the occupancy lever is finished across the whole pipeline and
-the next session should not open another one.
+- **A win** confirms the bandwidth rule is predictive and not just
+  descriptive, which makes it worth applying to the transposes and to
+  anything added later.
+- **A loss** means the rule is post-hoc and `t8`'s result was real and
+  uniform. Say so plainly in this file and stop tuning block sizes; nothing
+  else here depends on the rule.
 
-## Next, in order of expected value
-
-1. **Re-profile v2 on the A100.** This is now the top item regardless of how
-   `c4` lands, and it should come before any further kernel work. v2 is
-   +21.4% against JAX and **v2's time has not been attributed since before
-   `t4`** -- two block-size changes ago. The old breakdown is the table in
-   the A100-profile session; everything in it that matters has moved. The
-   traps list at the top has the `nsys` recipe and the three ways it goes
-   wrong. `CUPTI_ACTIVITY_KIND_KERNEL` also carries `registersPerThread`,
-   which would settle whether `t4w8`'s 4 -> 6 blocks/SM actually happened --
-   the one loose end from that entry.
-2. **Structural work on the FFT kernels, chosen from that profile.** They
-   are 79% of the A100 iteration and sit at 16-29% of peak bandwidth. The
-   levers that have not been tried are shared-memory traffic and barrier
-   count per row, not block size: radix-8 fused stages (halving the barrier
-   count again the way radix-4 did), or keeping more of the transform in
-   registers across stages. Pick from measurements, not from this list.
-3. **Getting `t4` to 4 blocks/SM** by holding registers at 32. Still blocked
-   on there being no `__launch_bounds__` equivalent in this Mojo version.
+Either way, **re-profile v2 next** -- see item 1 in START HERE. Four
+block-size changes have landed since the only A100 breakdown of this
+pipeline was taken, v2 is +21.4% against JAX, and there is no current
+attribution of where that time goes. Continuing to pick kernels from a stale
+profile plus a one-line rule is how the last two magnitude predictions went
+wrong.

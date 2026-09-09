@@ -1874,7 +1874,7 @@ def rfft2_batched_gpu_div_t[
 
 def irfft2_batched_gpu_cmul_broadcast_mul_t[
     D: Int, H: Int, W: Int, TILE: Int, SHIFT: Bool, TW: Bool = False,
-    TDIV: Int = 2, WDIV: Int = 4,
+    TDIV: Int = 2, WDIV: Int = 4, IDIV: Int = TDIV,
 ](
     ctx: DeviceContext,
     mut a_re: DeviceBuffer[DType.float32],  # (W/2+1, H), broadcast over depth
@@ -1914,15 +1914,22 @@ def irfft2_batched_gpu_cmul_broadcast_mul_t[
     comptime W2 = W // 2 + 1
     comptime a_row_layout = row_major[W2, H]()
     comptime b_row_layout = row_major[D * W2, H]()
-    comptime HT = H // TDIV
+    # `IDIV`, not `TDIV`: this kernel and `fft_row_kernel` were sized by one
+    # knob until the `w8` session found that a kernel's response to a
+    # smaller block tracks how far under peak DRAM bandwidth it already is.
+    # They are on opposite sides of that line -- 16% of peak here against
+    # 22% there before `t4`, and further apart after it -- so one knob was
+    # holding them at a compromise neither wants. `IDIV` defaults to `TDIV`,
+    # which is exactly the old behaviour.
+    comptime HI = H // IDIV
     comptime kernel_h = ifft_row_cmul_broadcast_kernel[
-        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW, HT
+        H, D, W2, type_of(b_row_layout), type_of(a_row_layout), type_of(b_row_layout), TW, HI
     ]
     ctx.enqueue_function[kernel_h](
         TileTensor(b_re, b_row_layout), TileTensor(b_im, b_row_layout),
         TileTensor(a_re, a_row_layout), TileTensor(a_im, a_row_layout),
         TileTensor(t_re, b_row_layout), TileTensor(t_im, b_row_layout),
-        grid_dim=D * W2, block_dim=HT,
+        grid_dim=D * W2, block_dim=HI,
     )
 
     comptime in_layout_b = row_major[D, W2, H]()
