@@ -218,3 +218,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 openflr-mojo/.rocprofv3
+openflr-mojo/*.nsys-rep
+openflr-mojo/*.sqlite
