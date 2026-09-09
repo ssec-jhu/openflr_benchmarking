@@ -2084,6 +2084,45 @@ its order. `base` remains bit-identical too. Full `pixi run test` passes.
 | `tw` | 8.583e-06 | differs by 2.861e-06 |
 | `t4` | 8.583e-06 | **bit-identical** |
 
+## Measured on the A100: it works
+
+| version | base | tw | **t4** | t4 vs base |
+|---|---|---|---|---|
+| v1 | 0.019048 s | 0.021165 s | **0.018549 s** | **-2.6%** |
+| v2 | 0.014761 s | 0.016164 s | **0.013730 s** | **-7.0%** |
+
+Standard deviations are 2e-5 to 6e-5 s (0.2-0.4%), so these are cleanly
+separated. **The previous session's latency reading is confirmed in
+direction**: giving the SM twice as many blocks to run while one sits at a
+barrier is worth 7% of the whole v2 iteration.
+
+Magnitude, though, is well short of what a straight doubling of resident
+blocks might suggest. Scaling the sec. 2 per-kernel table to wall time
+(the instrumented iteration was 17.56 ms against a 14.76 ms benchmark, so
+x0.841), the two kernels `t4` touches were 6.24 ms of v2's 14.76. Saving
+1.03 ms is **17% off those two kernels**, not 50%. Either registers
+capped the kernels at 3 blocks/SM rather than 4 (see the risk note below,
+still unmeasured), or barrier stalls are only part of what those kernels
+wait on.
+
+v1 gains less (-2.6%) for a structural reason, not a mysterious one: its
+largest dispatch is `fft_row_cmul_ifft_kernel`, which this change
+deliberately does not touch. v1's only `t4` beneficiaries are
+`ifft_row_cmul_broadcast_kernel` and the small (1,H,W) kernels.
+
+### Where that leaves the comparison
+
+| | mojo `t4` | jax | torch |
+|---|---|---|---|
+| v1 | 0.018549 s | 0.017216 s (+-1.4%) | 0.019629 s (+-68%) |
+| v2 | 0.013730 s | 0.011200 s (+-2.1%) | 0.011210 s (+-42%) |
+
+v1 is now **within 7.7% of JAX**, down from 20.5% at the original
+`results.md` measurement. It also comes out 5.5% under torch's v1 — but
+torch's v1 number carries a 68% relative standard deviation, so that
+ranking is not meaningful; treat JAX as the only stable reference on this
+machine. v2 remains 22.6% behind JAX.
+
 ## Measured on gfx1151: neutral
 
 | version | base | tw | t4 |
@@ -2114,3 +2153,78 @@ nsys profile --trace=cuda -o t4_regs \
 
 then read `registersPerThread` and `blockX` out of
 `CUPTI_ACTIVITY_KIND_KERNEL` in the `.sqlite`.
+
+## Register follow-up: `t4` got 3 blocks/SM, not 4 — and `t8` added
+
+`nsys` trace of the `t4` arm (`t4_regs.sqlite`), reading
+`registersPerThread` / `blockX` per dispatch:
+
+| kernel | thr | reg | blk/SM | base us | t4 us | delta |
+|---|---|---|---|---|---|---|
+| `rfft_row_kernel` | 512 | 32 | 4 | 2300.7 | 2299.3 | -0.1% |
+| `transpose_kernel` | 1024 | 16 | 2 | 1021.3 | 1021.1 | -0.0% |
+| **`fft_row_kernel`** | **512** | **40** | **3** | 3046.1 | 2529.0 | **-17.0%** |
+| `complex_mul_kernel` | 256 | 18 | 8 | 1160.7 | 1161.0 | 0.0% |
+| `sum_over_depth_kernel` | 256 | 28 | 8 | 454.9 | 450.1 | -1.1% |
+| **`ifft_row_cmul_broadcast`** | **512** | **40** | **3** | 4384.8 | 3772.5 | **-14.0%** |
+| `irfft_row_mul_kernel` | 512 | 32 | 4 | 3719.0 | 3326.8 | -10.5% (see below) |
+
+**Registers went 31 -> 40, so `t4` bought 3 blocks/SM, not 4.** The +9 is
+almost exactly the 8 floats of a second head block's loads: the compiler
+hoisted both head blocks' global loads together despite the sequential
+structure the code is written in. So the measured -7% on v2 came from a
+1.5x increase in resident blocks, not 2x. There is no `__launch_bounds__`
+equivalent in this Mojo version (checked the compiled stdlib for
+`launch_bounds`, `maxntid`, `minnctapersm`, `max_registers`), so capping
+registers directly is not available; forcing the loads apart would need a
+scheduling barrier between head blocks, which costs a `barrier()`.
+
+Cross-check: the four changed dispatches went 7591.8 -> 6443.0 us
+(-15.1%), which is -6.5% of the iteration against the -7.0% the benchmark
+measured independently.
+
+### Two measurement notes for whoever profiles this next
+
+- **The unchanged kernels are the control**, and they land within 1.1%.
+  That is what makes the -14%/-17% on the changed ones trustworthy.
+- **There is a GPU clock step in this trace, around dispatch 91.** The same
+  `rfft_row_kernel` (identical name hash, unchanged code) runs 2299.3 us at
+  dispatch 79 and 1867.8 us at dispatch 93, -18.8%. `irfft_row_mul_kernel`'s
+  -10.5% above is that step leaking in, not an effect of `t4` -- that kernel
+  was not changed. The table compares two *adjacent* iterations to stay on
+  one side of the step. Any comparison spanning it is invalid. `nsys` does
+  not lock clocks the way `ncu` does.
+
+### Latent bug found and fixed
+
+`fft_lds_stages` only worked for `THREADS >= N/4`: its fused stages have
+`N/4` tasks behind `if tid < num_tasks`, so a smaller block would have
+silently skipped tasks and produced wrong results with nothing to catch it.
+Both loops now take `ceil(tasks/THREADS)` iterations each. At
+`THREADS == N/2` that is one iteration with `tt == tid`, so `base` stays
+bit-identical -- verified.
+
+### `t8` (TDIV=8, 256 threads)
+
+The register data makes this the more promising configuration on paper: at
+256 threads, 40 registers gives 65536/1280 = 51 warps -> **6 blocks/SM**,
+against the base's 2 and `t4`'s 3. Shared memory (16 KB x 6 = 96 KB) and
+threads (1536) both stay inside the A100's limits. Added as a fourth arm.
+
+Correctness: `t4` and `t8` are both **bit-identical to the pre-flag code**
+for v1 and v2 at full scale; `base` likewise. Full `pixi run test` passes.
+
+**gfx1151 says `t8` is worse**, consistently and beyond the noise:
+
+| version | base | tw | t4 | t8 |
+|---|---|---|---|---|
+| v1 | 0.08929 s | 0.08984 s | 0.09105 s | 0.09605 s |
+| v2 | 0.07518 s | 0.07259 s | 0.07452 s | 0.08081 s |
+
+(`base`/`t4` scatter run to run on this machine -- `base` here carries a
+4.8 ms std -- but `t8`'s +7.5% appears in both versions and exceeds it.)
+That is a real caution, not a transferable verdict: this GPU is DRAM-bound
+in these kernels and its occupancy is not register-capped the way the
+A100's is. The trade `t8` makes is more resident blocks against four head
+blocks and eight elements of sequential work per thread, and only the A100
+can say which side wins there.

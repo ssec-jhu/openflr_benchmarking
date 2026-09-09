@@ -280,13 +280,15 @@ def fft_lds_stages[
     `log2(N) - first_stage` is odd) is a plain radix-2 stage over `N/2`
     tasks.
 
-    `THREADS` is the launching block's size. At the traditional `N/2` a
-    fused stage leaves half the block idle at the `if tid < num_tasks`
-    guard while it still occupies the SM's thread budget and still has to
-    reach every `barrier()`; at `N/4` every thread works and twice as many
-    blocks fit per SM. The odd stage is the mirror case -- it has `N/2`
-    tasks, so it loops `N/(2*THREADS)` times. Both degenerate to exactly
-    the old code at `THREADS == N/2`.
+    `THREADS` is the launching block's size, and both loops adapt to it:
+    the fused stages have `N/4` tasks and the odd stage `N/2`, so each
+    thread takes `ceil(tasks/THREADS)` of them. At the traditional `N/2` a
+    fused stage leaves half the block idle at the guard while those warps
+    still occupy the SM's thread budget and still have to reach every
+    `barrier()`; smaller blocks give every thread work and fit more blocks
+    per SM. Both loops degenerate to exactly the old code at
+    `THREADS == N/2` (one iteration, `tt == tid`), so that configuration
+    stays bit-identical.
 
     `first_stage` is 6 when the caller ran `fft_warp_head` first and 0 when
     it did not (`N < 64`, or no 32-wide warps). Leaves the finished spectrum
@@ -303,57 +305,59 @@ def fft_lds_stages[
         comptime half_m = m // 2
         comptime span = 2 * m
         comptime num_tasks = N // 4
-        if tid < num_tasks:
-            var group = tid // half_m
-            var k = tid % half_m
-            var p0 = group * span + k
-            var p1 = p0 + half_m
-            var p2 = p0 + m
-            var p3 = p2 + half_m
+        comptime for r in range(ceildiv(num_tasks, THREADS)):
+            var tt = tid + r * THREADS
+            if tt < num_tasks:
+                var group = tt // half_m
+                var k = tt % half_m
+                var p0 = group * span + k
+                var p1 = p0 + half_m
+                var p2 = p0 + m
+                var p3 = p2 + half_m
 
-            var a0r = s_re[p0]
-            var a0i = s_im[p0]
-            var a1r = s_re[p1]
-            var a1i = s_im[p1]
-            var a2r = s_re[p2]
-            var a2i = s_im[p2]
-            var a3r = s_re[p3]
-            var a3i = s_im[p3]
+                var a0r = s_re[p0]
+                var a0i = s_im[p0]
+                var a1r = s_re[p1]
+                var a1i = s_im[p1]
+                var a2r = s_re[p2]
+                var a2i = s_im[p2]
+                var a3r = s_re[p3]
+                var a3i = s_im[p3]
 
-            var angle_a_tw = twiddle[N, m, TW, invert](t_re, t_im, k)
-            var war = angle_a_tw[0]
-            var wai = angle_a_tw[1]
-            var tar = a1r * war - a1i * wai
-            var tai = a1r * wai + a1i * war
-            var y0r = a0r + tar
-            var y0i = a0i + tai
-            var y1r = a0r - tar
-            var y1i = a0i - tai
-            var tbr = a3r * war - a3i * wai
-            var tbi = a3r * wai + a3i * war
-            var y2r = a2r + tbr
-            var y2i = a2i + tbi
-            var y3r = a2r - tbr
-            var y3i = a2i - tbi
+                var angle_a_tw = twiddle[N, m, TW, invert](t_re, t_im, k)
+                var war = angle_a_tw[0]
+                var wai = angle_a_tw[1]
+                var tar = a1r * war - a1i * wai
+                var tai = a1r * wai + a1i * war
+                var y0r = a0r + tar
+                var y0i = a0i + tai
+                var y1r = a0r - tar
+                var y1i = a0i - tai
+                var tbr = a3r * war - a3i * wai
+                var tbi = a3r * wai + a3i * war
+                var y2r = a2r + tbr
+                var y2i = a2i + tbi
+                var y3r = a2r - tbr
+                var y3i = a2i - tbi
 
-            var angle0_tw = twiddle[N, span, TW, invert](t_re, t_im, k)
-            var w0r = angle0_tw[0]
-            var w0i = angle0_tw[1]
-            var t0r = y2r * w0r - y2i * w0i
-            var t0i = y2r * w0i + y2i * w0r
-            var tcr = y3r * w0r - y3i * w0i
-            var tci = y3r * w0i + y3i * w0r
-            var t1r = -sign * tci
-            var t1i = sign * tcr
+                var angle0_tw = twiddle[N, span, TW, invert](t_re, t_im, k)
+                var w0r = angle0_tw[0]
+                var w0i = angle0_tw[1]
+                var t0r = y2r * w0r - y2i * w0i
+                var t0i = y2r * w0i + y2i * w0r
+                var tcr = y3r * w0r - y3i * w0i
+                var tci = y3r * w0i + y3i * w0r
+                var t1r = -sign * tci
+                var t1i = sign * tcr
 
-            s_re[p0] = y0r + t0r
-            s_im[p0] = y0i + t0i
-            s_re[p2] = y0r - t0r
-            s_im[p2] = y0i - t0i
-            s_re[p1] = y1r + t1r
-            s_im[p1] = y1i + t1i
-            s_re[p3] = y1r - t1r
-            s_im[p3] = y1i - t1i
+                s_re[p0] = y0r + t0r
+                s_im[p0] = y0i + t0i
+                s_re[p2] = y0r - t0r
+                s_im[p2] = y0i - t0i
+                s_re[p1] = y1r + t1r
+                s_im[p1] = y1i + t1i
+                s_re[p3] = y1r - t1r
+                s_im[p3] = y1i - t1i
         barrier()
 
     comptime if (log2n - first_stage) % 2 == 1:

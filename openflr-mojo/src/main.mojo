@@ -10,7 +10,8 @@ Usage:
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
 Arms: `base` (TW=False, TDIV=2, bit-identical to the pre-flag kernels),
-`tw` (shared twiddle table), `t4` (half-size column-FFT blocks).
+`tw` (shared twiddle table), `t4`/`t8` (column-FFT blocks at N/4 and N/8
+threads, for more resident blocks per SM).
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -153,7 +154,7 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "base" or a == "tw" or a == "t4":
+        elif a == "base" or a == "tw" or a == "t4" or a == "t8":
             arm = a
         else:
             n_iters = Int(a)
@@ -191,8 +192,12 @@ def main() raises:
     #   base  TW=False TDIV=2  -- bit-identical to the pre-flag kernels
     #   tw    TW=True  TDIV=2  -- shared twiddle table (optimizations.md s.2)
     #   t4    TW=False TDIV=4  -- half-size blocks on the two column-FFT
-    #                             kernels, so twice as many fit per SM
-    #                             (optimizations.md s.5)
+    #                             kernels: 512 threads, 3 blocks/SM
+    #   t8    TW=False TDIV=8  -- quarter-size: 256 threads. `t4` measured
+    #                             40 registers, which caps 512-thread
+    #                             blocks at 3/SM; at 256 threads the same
+    #                             40 registers allow 6 (optimizations.md
+    #                             s.5 and the register note)
     #
     # Naming one of `base`, `tw`, `t4` runs just that arm, which is what a
     # profiler wants: every arm dispatches same-named kernels differing only
@@ -213,10 +218,11 @@ def main() raises:
             )
     ctx.synchronize()
 
-    comptime for arm_i in range(3):
+    comptime for arm_i in range(4):
         comptime TW = arm_i == 1
-        comptime TDIV = 4 if arm_i == 2 else 2
-        comptime arm_name = "tw" if arm_i == 1 else ("t4" if arm_i == 2 else "base")
+        comptime TDIV = 8 if arm_i == 3 else (4 if arm_i == 2 else 2)
+        comptime arm_name = "tw" if arm_i == 1 else (
+            "t4" if arm_i == 2 else ("t8" if arm_i == 3 else "base"))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":
