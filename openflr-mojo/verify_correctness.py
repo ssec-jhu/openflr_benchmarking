@@ -44,7 +44,7 @@ def numpy_reference(version: str) -> np.ndarray:
         return run_numpy_v2_step(data, img, psf_fft, psft_fft)
 
 
-ARMS = ("base", "t4w8c4", "t4w8c4g", "t4w8c4G", "t8w8c4G")
+ARMS = ("base", "t4w8c4", "t8w8c4G", "t8w8c4Gi8", "t8w16c4G")
 BIT_EXACT = ARMS  # every arm is a pure work-mapping change
 
 

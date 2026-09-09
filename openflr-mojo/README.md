@@ -87,9 +87,10 @@ pixi run verify                       # every arm vs the numpy reference, full s
 Each run benchmarks five **arms** — compile-time configurations threaded
 from `main.mojo` down to the kernels, each giving some group of kernels a
 different block size — and prints one line each: `base` (the reference
-implementation), `t4w8c4`, `t4w8c4g`, `t4w8c4G` and `t8w8c4G`. `t4w8c4g` is the
-fastest measured on the A100; the last two are written and verified but not
-yet measured there. All five arms are bit-identical to each other by
+implementation), `t4w8c4`, `t8w8c4G`, `t8w8c4Gi8` and `t8w16c4G`. `t8w8c4G` is the
+fastest measured on the A100 — 1.36x faster than JAX on v1 and 1.22x on v2;
+the last two re-ask block-size questions that were settled before the
+coalesced-gather change landed. All five arms are bit-identical to each other by
 construction — they only remap work across threads — and `pixi run verify`
 asserts it. See `optimizations.md` for what each knob sizes and which two
 arms are there as measurement controls rather than as candidates.

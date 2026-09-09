@@ -9,11 +9,11 @@ Usage:
     mojo run main.mojo -- v2 20 t4         # one arm (what a profiler wants)
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
-Arms: `base` (the pre-flag kernels), `t4w8` (an intermediate kept as a
-cross-run check), `t4w8c4` (the best measured configuration), `t8w8c4`
-(`fft_row_kernel` alone at 256-thread blocks) and `t4w8c4g` (`fft_row_kernel`
-reading its row coalesced and doing the bit-reversal in shared memory). All
-five are bit-identical: they only remap work across threads and memory.
+Arms: `base` (the pre-flag kernels), `t4w8c4` (kept as the cross-run
+anchor), `t8w8c4G` (the best measured configuration), and `t8w8c4Gi8` /
+`t8w16c4G`, which re-ask two block-size questions that were last answered
+before the coalesced gather landed. All five are bit-identical: they only
+remap work across threads and memory.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -156,8 +156,8 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif (a == "base" or a == "t4w8c4" or a == "t4w8c4g"
-              or a == "t4w8c4G" or a == "t8w8c4G"):
+        elif (a == "base" or a == "t4w8c4" or a == "t8w8c4G"
+              or a == "t8w8c4Gi8" or a == "t8w16c4G"):
             arm = a
         else:
             n_iters = Int(a)
@@ -192,43 +192,33 @@ def main() raises:
     # so the numbers are directly comparable and a whole sweep costs one
     # batch job on a cluster with no interactive access:
     #
-    #   base     TDIV=2 WDIV=4 CDIV=2 IDIV=2
+    #   base      TDIV=2 WDIV=4 CDIV=2 IDIV=2 CG=0
     #                           -- bit-identical to the pre-flag kernels
-    #   t4w8     TDIV=4 WDIV=8 -- 512-thread column blocks and 256-thread
-    #                             width blocks. Superseded, but kept: it
-    #                             was measured on two separate runs, so it
-    #                             is the cross-run anchor that says whether
-    #                             a new run is comparable to the old ones
-    #   t4w8c4   + CDIV=4       -- plus 512-thread blocks on
-    #                             `fft_row_cmul_ifft_kernel`. Measured
-    #                             -4.95% on v1; the current best. v1 only,
-    #                             so on v2 it duplicates `t4w8` and doubles
-    #                             as a within-run reproducibility control
-    #   t8w8c4   TDIV=8 IDIV=4  -- `t4w8c4` with `fft_row_kernel` alone
-    #                             dropped to 256 threads,
-    #                             `ifft_row_cmul_broadcast_kernel` left at
-    #                             512. The other half of the split `t8`
-    #                             conflated: `t8` moved both and lost 2.7%,
-    #                             `t4w8c4i8` moved only the broadcast one
-    #                             and lost 4.3%, which implies this
-    #                             configuration *gains* ~1.6%. Affects both
-    #                             versions
-    #   t4w8c4g  + CG=True      -- `t4w8c4` with `fft_row_kernel`'s opening
-    #                             bit-reversed gather moved off global
-    #                             memory. That gather makes one warp's load
-    #                             touch 32 distinct 32-byte sectors where a
-    #                             coalesced one touches 4; reading the row
-    #                             coalesced and permuting it in shared
-    #                             memory instead costs two barriers and a
-    #                             shared round trip. Mostly a v2 arm -- v1
-    #                             dispatches this kernel only on the small
-    #                             (1,H,W) stages
+    #   t4w8c4    CG=0          -- the cross-run anchor: five runs at
+    #                             0.01360-0.01362 on v2. If it moves more
+    #                             than ~0.1% the run is not comparable to
+    #                             the numbers in optimizations.md
+    #   t8w8c4G   TDIV=8 WDIV=8 CDIV=4 IDIV=4 CG=2
+    #                           -- the best measured configuration: every
+    #                             row-FFT kernel reads its row coalesced and
+    #                             bit-reverses in shared memory (CG=2, worth
+    #                             -31.5% on v2), plus the block sizes three
+    #                             earlier sessions settled
+    #   t8w8c4Gi8 + IDIV=8      -- `ifft_row_cmul_broadcast_kernel` back to
+    #                             256 threads. It lost 4.28% pre-gather, the
+    #                             largest block-size effect measured here in
+    #                             either direction; the gather fix already
+    #                             moved one such answer by a third, so it is
+    #                             worth one retest
+    #   t8w16c4G  + WDIV=16     -- the width kernels at 128 threads, the
+    #                             other stale block-size answer (-0.19% on
+    #                             v2 pre-gather, close enough to nothing to
+    #                             flip)
     #
-    # Retired after being measured and losing: `tw` (a shared twiddle
-    # table), `t8` (both column kernels at 256 threads), `t4w16`
-    # (128-thread width blocks) and `t4w8c4i8` (256-thread
-    # `ifft_row_cmul_broadcast_kernel`). See optimizations.md s.2, s.5, and
-    # the `w8`, `c4` and `i8` sessions.
+    # Retired after being measured: `tw` (a shared twiddle table), `t8`
+    # (both column kernels at 256 threads -- a win and a larger loss added
+    # together, see the `i8` session), `t4w16`, `t4w8c4i8`, `t4w8`, and
+    # `t4w8c4g` (CG on `fft_row_kernel` alone, superseded by CG=2).
     #
     # Naming one of `base`, `t4w8`, `t4w8c4` runs just that arm, which is what a
     # profiler wants: every arm dispatches same-named kernels differing only
@@ -261,18 +251,17 @@ def main() raises:
 
     comptime for arm_i in range(5):
         comptime TW = False
-        comptime TDIV = 2 if arm_i == 0 else (8 if arm_i == 4 else 4)
-        comptime WDIV = 4 if arm_i == 0 else 8
+        comptime TDIV = 2 if arm_i == 0 else (4 if arm_i == 1 else 8)
+        comptime WDIV = 4 if arm_i == 0 else (16 if arm_i == 4 else 8)
         comptime CDIV = 4 if arm_i >= 1 else 2
-        # Pinned to 4 on the `t8w8c4G` arm so `TDIV` moves `fft_row_kernel`
-        # and nothing else; everywhere else it tracks `TDIV`, as it always
-        # did.
-        comptime IDIV = 4 if arm_i == 4 else TDIV
+        # Pinned to 4 wherever `TDIV` is 8, so `TDIV` moves `fft_row_kernel`
+        # and nothing else; the `i8` arm is the one that moves it.
+        comptime IDIV = 8 if arm_i == 3 else (4 if arm_i >= 2 else TDIV)
         # 0 = off, 1 = `fft_row_kernel` only, 2 = every row-FFT kernel.
-        comptime CG = 2 if arm_i >= 3 else (1 if arm_i == 2 else 0)
+        comptime CG = 0 if arm_i <= 1 else 2
         comptime arm_name = "t4w8c4" if arm_i == 1 else (
-            "t4w8c4g" if arm_i == 2 else ("t4w8c4G" if arm_i == 3 else (
-                "t8w8c4G" if arm_i == 4 else "base")))
+            "t8w8c4G" if arm_i == 2 else ("t8w8c4Gi8" if arm_i == 3 else (
+                "t8w16c4G" if arm_i == 4 else "base")))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":

@@ -13,32 +13,30 @@ has.
 
 ## Where things stand
 
-The target is the A100-SXM4-80GB. Best measured configuration is the
-`t4w8c4g` arm:
+The target is the A100-SXM4-80GB. **The original goal is met: Mojo is now
+faster than JAX and torch on both versions.** Best measured configuration is
+the `t8w8c4G` arm:
 
-| | mojo `t4w8c4g` | jax | torch | gap to jax |
+| | mojo `t8w8c4G` | jax | torch | vs jax |
 |---|---|---|---|---|
-| v1 | 0.017530 s | 0.017216 s | 0.0196 s | **+1.82%** |
-| v2 | 0.012832 s | 0.011200 s | 0.0112 s | **+14.6%** |
+| v1 | 0.012650 s | 0.017216 s | 0.0196 s | **1.36x faster** |
+| v2 | 0.009218 s | 0.011200 s | 0.0112 s | **1.22x faster** |
 
-v1 began this effort 20.5% behind JAX and is now within 2% of it, ahead of
-torch, and **effectively done**. v2 started at +21.4% when it was last
-profiled and is the whole remaining problem. Published in `../results.md`.
-On the gfx1151 iGPU the same code beats ROCm JAX by 1.8x and ROCm torch by
-3.9x, so the kernels are not weak in general -- the remaining gap is
-A100-specific tuning.
+v1 began this effort at 0.020746 s, 20.5% *behind* JAX; it is now 1.64x
+faster than it started. Against the `base` arm this file began measuring:
+-33.9% on v1, -37.5% on v2. Published in `../results.md`. On the gfx1151
+iGPU the same code also beats ROCm JAX by 1.8x and ROCm torch by 3.9x.
 
-**The live lever is the bit-reversed opening gather, not block size.** Every
-row-FFT kernel here gathers `bit_reverse(64*w + l)` for lane `l`, which puts
-consecutive lanes 256 bytes apart: one warp's load touches **32 distinct
-32-byte sectors where a coalesced load touches 4**. The rows are 8 KB and
-stay in L1, so it costs almost no DRAM traffic -- which is why the byte
-model used throughout this file never saw it -- but it inflates L1
+**One change is 80% of the A100 win: the bit-reversed opening gather.**
+Every row-FFT kernel used to gather `bit_reverse(64*w + l)` for lane `l`,
+which puts consecutive lanes 256 bytes apart -- one warp's load touching
+**32 distinct 32-byte sectors where a coalesced load touches 4**. The rows
+are 8 KB and stay in L1, so it cost almost no DRAM traffic (which is exactly
+why the byte model used throughout this file never saw it) but inflated L1
 wavefronts eightfold. Reading the row coalesced and doing the bit-reversal
-as a `lds_swizzle`d shared-memory scatter instead took `fft_row_kernel` down
-about 36% and v2 down 5.76%, and the rollout to the other three (`CG = 2`)
-is written and awaiting measurement. See the profile session and the one
-after it.
+as a `lds_swizzle`d shared-memory scatter instead is worth **-31.5% on v2
+and -27.8% on v1**, against 8% for three sessions of block-size tuning
+combined. See the profile session and the two after it.
 
 **Block size is spent, and occupancy was never the variable.** The profile
 measured `registersPerThread` per dispatch and closed this: `t4w8` really
@@ -137,9 +135,9 @@ The four arms, selected by compile-time parameters threaded from
 |---|---|---|---|---|---|---|
 | `base` | 2 | 4 | 2 | 2 | 0 | bit-identical to commit `9da8abd`, before any of this |
 | `t4w8c4` | 4 | 8 | 4 | 4 | 0 | superseded, kept as the **cross-run anchor** |
-| `t4w8c4g` | 4 | 8 | 4 | 4 | **1** | coalesced gather, `fft_row_kernel` only -- **best measured** |
-| `t4w8c4G` | 4 | 8 | 4 | 4 | **2** | coalesced gather everywhere -- **awaiting A100** |
-| `t8w8c4G` | **8** | 8 | 4 | 4 | 2 | + 256-thread `fft_row_kernel` -- **awaiting A100** |
+| `t8w8c4G` | 8 | 8 | 4 | 4 | 2 | **best measured** -- coalesced gather everywhere |
+| `t8w8c4Gi8` | 8 | 8 | 4 | **8** | 2 | retest of the 4.28% loser, post-gather |
+| `t8w16c4G` | 8 | **16** | 4 | 4 | 2 | retest of the 0.19% loser, post-gather |
 
 `CG` is the one knob that is not a block size: 0 off, 1 on
 `fft_row_kernel` only, 2 on every row-FFT kernel. The rest are: `TDIV` gives
@@ -164,28 +162,32 @@ twiddle table, sec. `tw`), `t8` (both column kernels at 256 threads),
 
 ## What must be done, in order
 
-**0. Measure `t4w8c4G` against `t4w8c4g` on v2.** The coalesced gather
-rolled out from one kernel to all five. `fft_row_kernel` was the smallest of
-the four big ones -- the other three are 7785 us against its 2162 -- so if
-they behave the same this is worth roughly -15% more, which would put v2
-near 10.2 ms against JAX's 11.2 ms. `t8w8c4G` rides along and asks whether
-the block-size win still composes once the gather is fixed.
+**The brief is satisfied -- everything below is optional.** Mojo beats JAX
+by 1.22-1.36x. Stop here unless there is a reason to keep going, and if
+there is, do it in this order.
 
-**1. Re-profile, whichever way it lands.** If `G` wins the kernel mix has
-moved completely and the next target has to be picked from a fresh
-breakdown, not from the one in the profile session. If it does not, `ncu` on
-one dispatch of `fft_row_kernel` for
-`l1tex__t_sectors_pipe_lsu_mem_global_op_ld` and
-`smsp__sass_average_data_bytes_per_sector_mem_global_op_ld` measures the
-amplification directly instead of inferring it from index algebra. Either
-way get `dram__bytes_read` while `ncu` is out and **validate the byte
-model** -- every GB/s figure in this file rests on it and none of them has
-ever been checked. Mind the `ncu` traps in the list below.
+**0. Re-profile.** Nothing else should be started first. v2 went 13.7 -> 9.2
+ms and the kernel mix inside it has moved completely; the breakdown in the
+profile session describes a pipeline that no longer exists. The recipe (and
+the warmup trap that makes an arm profile 97% `base`) is in the traps list
+below.
 
-**2. Other structural levers on the FFT kernels**, once the gather is
-exhausted: shared-memory traffic and barriers per row -- radix-8 fused
-stages, or holding more of the transform in registers across stages. Not
-block size, which is spent.
+**1. Validate the byte model while `ncu` is out.** `dram__bytes_read` on two
+or three dispatches. Every GB/s figure in this file is a model of *intended*
+traffic, none has ever been checked, and the gather finding is precisely a
+case the model was blind to -- 8x the L1 wavefronts, almost no extra DRAM
+traffic, invisible, and worth 31%. Also worth
+`l1tex__t_sectors_pipe_lsu_mem_global_op_ld` before and after `CG` to
+confirm the mechanism directly rather than by inference.
+
+**2. The two stale block-size retests** (`t8w8c4Gi8`, `t8w16c4G`), which
+ride along in any benchmark run. Cheap, and neither deserves a second round
+if it loses.
+
+**3. Structural levers on the FFT kernels**, chosen from the new profile:
+shared-memory traffic and barriers per row -- radix-8 fused stages, or
+holding more of the transform in registers across stages. Not block size,
+which is spent.
 
 **3. Get `t4` to 4 blocks/SM.** It currently gets 3: registers went 31 ->
 40 because the compiler hoists both head blocks' global loads together
@@ -3116,28 +3118,98 @@ is the only length it ever saw while `fft_row_cmul_ifft_kernel` was its sole
 user; the real-input kernels drive a length-1024 transform, where 6 would
 have left a 2-way bank conflict on the scatter. It is parametric now.
 
+## Measured: the rollout is the largest change in this file by a factor of four
+
+| | base | t4w8c4 | t4w8c4g | **t4w8c4G** | **t8w8c4G** |
+|---|---|---|---|---|---|
+| v1 | 0.019135 | 0.017546 | 0.017518 | 0.012653 | **0.012650** |
+| v2 | 0.014739 | 0.013608 | 0.012848 | 0.009308 | **0.009218** |
+
+**`t4w8c4G` vs `t4w8c4g`: -27.8% on v1 and -27.6% on v2.** Anchor `t4w8c4`
+reproduced to 0.06%.
+
+The prediction was "roughly -15% more". It was low by nearly 2x, and low in
+the useful direction for the first time. Two reasons: `ifft_row_cmul_broadcast`
+and `irfft_row_mul` were the two largest dispatches *and* the two worst
+against peak bandwidth, so they had the most to give; and v1, which barely
+dispatches `fft_row_kernel` and had been flat through the whole `g` arm,
+turns out to be dominated by the same gather everywhere else -- it gained
+just as much as v2 despite having gained nothing from `g`.
+
+**`t8w8c4G` vs `t4w8c4G`: -0.97% on v2, -0.03% on v1.** The block-size win
+on `fft_row_kernel` does compose with the gather fix, but only partly: it was
+-1.56% before and is -0.97% after, so the coalesced load absorbed about a
+third of what the extra resident blocks were hiding. On v1 it is gone
+entirely, which is expected -- v1 dispatches that kernel only on the small
+(1,H,W) stages.
+
+## Standing: Mojo is now faster than JAX on both versions
+
+| | mojo `t8w8c4G` | jax | torch | vs jax |
+|---|---|---|---|---|
+| v1 | 0.012650 s | 0.017216 s | 0.0196 s | **1.36x faster** |
+| v2 | 0.009218 s | 0.011200 s | 0.0112 s | **1.22x faster** |
+
+v1 started this effort at 0.020746 s, 20.5% *behind* JAX. It is now 1.64x
+faster than it was and 1.36x faster than JAX -- and 0.012650 s on an A100 is
+within 30% of JAX's *H100* v1 time. Against the `base` arm that this file
+began measuring: -33.9% on v1 and -37.5% on v2.
+
+Published in `../results.md`.
+
+## What actually mattered, in order
+
+Worth stating plainly, because the ordering was not obvious from inside it:
+
+| change | v2 |
+|---|---|
+| **coalesced opening gather (`G`)** | **-31.5%** (g and G together) |
+| 1024 -> 512 threads on three kernels (`t4`, `c4`) | -7.0% on v2, -8.2% on v1 |
+| 512 -> 256 on the width kernels (`w8`) | -1.0% |
+| 512 -> 256 on `fft_row_kernel` alone (`t8`) | -1.6%, -1.0% after `G` |
+
+One memory-access fix was worth four times every block-size change put
+together, and it was found by asking why two populations of kernel sat at
+22-37% and 69-87% of peak rather than by tuning the thing that had been
+tuned before. The three sessions of block-size work before it produced 8%
+between them and two wrong predictions.
+
+The deeper lesson is about the instrument. The byte model in this file --
+intended reads plus writes per kernel -- **cannot see this class of
+problem at all**: the rows are 8 KB and stay in L1, so the 8x wavefront
+inflation costs almost no DRAM traffic and shows up only as "this kernel is
+mysteriously at a third of peak". Every GB/s figure here rests on that
+model and none has ever been checked against `dram__bytes_read`. Do that
+before trusting the next one.
+
 ## What to run
 
-Five arms (`base`, `t4w8c4`, `t4w8c4g`, `t4w8c4G`, `t8w8c4G`):
+Five arms (`base`, `t4w8c4`, `t8w8c4G`, `t8w8c4Gi8`, `t8w16c4G`):
 
 ```
 pixi run mojo run src/main.mojo -- v2 20
 pixi run mojo run src/main.mojo -- v1 20
 ```
 
-`t4w8c4` is now the cross-run anchor -- 0.013606 / 0.013597 / 0.013616 /
-0.013616 across four runs on v2, and `t4w8` has been retired to make room.
-`t4w8c4g` is carried as the within-run reference for the rollout, since its
--5.76% is the number `t4w8c4G` has to beat.
+`t4w8c4` stays as the cross-run anchor -- 0.013606 / 0.013597 / 0.013616 /
+0.013616 / 0.013608 across five runs on v2. If it moves more than ~0.1% the
+run is not comparable to anything in this file.
 
-- **`t4w8c4G` vs `t4w8c4g` on v2** is the rollout. If the other three
-  kernels behave like the first, expect roughly -15% more.
-- **`t8w8c4G` vs `t4w8c4G`** asks whether the block-size win and the gather
-  win compose on `fft_row_kernel`. If it is flat, the coalesced gather has
-  absorbed what the extra blocks were hiding -- interesting, and it settles
-  the block-size question for good.
+The two new arms **re-ask block-size questions that were answered under a
+bottleneck that no longer exists.** Every block-size measurement in this
+file was taken while the opening gather was inflating L1 wavefronts eightfold,
+and `t8w8c4G` has already shown that removing the gather moved one of those
+answers by a third (-1.56% -> -0.97%). So the losers are worth one retest
+each, cheapest first:
 
-v1 is +1.82% against JAX and effectively finished; read it as a regression
-check, not a result. If `G` lands, **re-profile before anything else** --
-the whole kernel mix will have moved and the byte model should finally be
-validated against `dram__bytes_read` while `ncu` is out.
+- **`t8w8c4Gi8`** -- `ifft_row_cmul_broadcast_kernel` back to 256 threads.
+  It lost **4.28%** pre-gather, the largest block-size effect ever measured
+  here in either direction, and that kernel was also the one furthest below
+  peak (22%). Largest possible swing of anything left.
+- **`t8w16c4G`** -- the width kernels at 128 threads. It lost 0.19% on v2
+  pre-gather, close enough to nothing that the gather fix could plausibly
+  flip it.
+
+Neither is a hypothesis about a mechanism, and neither should get a second
+round if it loses: they are cheap retests of stale measurements, nothing
+more. **The substantive next step is to re-profile** -- see item 1.
