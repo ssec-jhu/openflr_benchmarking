@@ -157,6 +157,25 @@ def twiddle[N: Int, L: Int, TW: Bool, invert: Bool](
         return SIMD[DType.float32, 2](cos(angle), sin(angle))
 
 
+def lds_swizzle(i: Int) -> Int:
+    """Index swizzle for the shared-memory buffer that
+    `fft_row_cmul_ifft_kernel` hands from its forward pass to its inverse
+    pass.
+
+    The inverse pass opens with a bit-reversed gather. Reading that gather
+    straight out of shared memory is a 32-way bank conflict: for `N = 2048`
+    (`log2n = 11`) the element warp `w` / lane `l` wants sits at
+    `bit_reverse(64*w + l) == 64*rev5(l) + rev5(w)`, so every lane in the
+    warp lands on bank `rev5(w)` -- the same one. Storing element `i` at
+    `i ^ ((i >> 6) & 31)` instead leaves the 64-element block an element
+    belongs to untouched (only bits 0-4 move) while making the gather's
+    bank `rev5(w) ^ rev5(l)`, which is distinct for every lane. The
+    permutation is an involution and a bijection within each 32-element
+    aligned block, so it is a pure relabelling of shared memory: nothing
+    about the arithmetic changes. For `N < 64` it is the identity."""
+    return i ^ ((i >> 6) & 31)
+
+
 def fft_warp_head[N: Int, invert: Bool, TW: Bool](
     t_re: TileTensor[
         DType.float32, type_of(row_major[tw_alloc(N, TW)]()), MutAnyOrigin,
@@ -394,8 +413,106 @@ def fft_lds_stages[
         barrier()
 
 
+def fft_lds_head[
+    N: Int, invert: Bool, TW: Bool, THREADS: Int, TN: Int = N
+](
+    t_re: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(TN, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    t_im: TileTensor[
+        DType.float32, type_of(row_major[tw_alloc(TN, TW)]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    s_re: TileTensor[
+        DType.float32, type_of(row_major[N]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    s_im: TileTensor[
+        DType.float32, type_of(row_major[N]()), MutAnyOrigin,
+        address_space = AddressSpace.SHARED,
+    ],
+    tid: Int,
+):
+    """`fft_warp_head` fed from shared memory instead of from a bit-reversed
+    gather out of global memory.
+
+    On entry `s_re`/`s_im` hold the row already permuted into bit-reversed
+    order and passed through `lds_swizzle` -- that is, the element with
+    natural index `n` sits at `lds_swizzle(bit_reverse(n))`. Since
+    bit-reversal is self-inverse, the element the head wants for position
+    `pos` is then simply at `lds_swizzle(pos)`. On exit the arrays hold the
+    row after stage 32 in natural, unswizzled order, ready for
+    `fft_lds_stages[..., 6, ...]`, with a trailing `barrier()`.
+
+    **Why this exists.** The opening gather of every row-FFT kernel here
+    reads element `bit_reverse(64*blk + lane)` for lane `lane`, which for
+    `N = 2048` is `rev5(lane)*64 + rev5(blk)`: consecutive lanes land 64
+    elements (256 bytes) apart, so one warp's load touches **32 distinct
+    32-byte sectors instead of the 4 a coalesced load would**. That is an
+    8x inflation of L1 wavefronts on the load side of a kernel whose stores
+    are already perfectly coalesced, and it is the leading explanation for
+    why every FFT-bearing kernel in this pipeline sits at 22-37% of peak
+    DRAM bandwidth while every other kernel reaches 69-87%. Reading the row
+    coalesced and doing the bit-reversal as a *shared-memory* scatter moves
+    that permutation somewhere it is nearly free: `lds_swizzle` makes both
+    the scatter and this gather bank-conflict-free (see its docstring for
+    the algebra), at the cost of two extra `barrier()`s and one extra
+    shared round trip.
+
+    The gather has to complete for every head block before any of the
+    stores, because a warp's read set and write set are the same 64-element
+    block -- hence the `SIMD[float32, heads]` register array and the middle
+    barrier, the same shape as `fft_row_cmul_ifft_kernel`'s inverse pass.
+
+    Arithmetic is unchanged: the same values reach the same lanes in the
+    same order, so a kernel built on this is bit-identical to one that
+    gathers from global."""
+    comptime assert s_re.flat_rank == 1, "expected flat shared row"
+    comptime heads = (N // 2) // THREADS
+    comptime num_warps = THREADS // 32
+    comptime assert THREADS % 32 == 0, "THREADS must be a multiple of the warp"
+
+    var warp = tid // 32
+    var lane = tid % 32
+
+    barrier()
+
+    var ga_re = SIMD[DType.float32, heads](0)
+    var ga_im = SIMD[DType.float32, heads](0)
+    var gb_re = SIMD[DType.float32, heads](0)
+    var gb_im = SIMD[DType.float32, heads](0)
+    comptime for h in range(heads):
+        var blk = warp + h * num_warps
+        var sa = lds_swizzle(64 * blk + lane)
+        var sb = lds_swizzle(64 * blk + lane + 32)
+        ga_re[h] = rebind[Scalar[DType.float32]](s_re[sa])
+        ga_im[h] = rebind[Scalar[DType.float32]](s_im[sa])
+        gb_re[h] = rebind[Scalar[DType.float32]](s_re[sb])
+        gb_im[h] = rebind[Scalar[DType.float32]](s_im[sb])
+    barrier()
+
+    comptime for h in range(heads):
+        var blk = warp + h * num_warps
+        var pos_a = 64 * blk + lane
+        var pos_b = pos_a + 32
+        var a_re = ga_re[h]
+        var a_im = ga_im[h]
+        var b_re = gb_re[h]
+        var b_im = gb_im[h]
+
+        fft_warp_head[TN, invert, TW](t_re, t_im, a_re, a_im, b_re, b_im, lane)
+
+        s_re[pos_a] = a_re
+        s_im[pos_a] = a_im
+        s_re[pos_b] = b_re
+        s_im[pos_b] = b_im
+    barrier()
+
+
 def fft_row_kernel[
-    N: Int, LT: TensorLayout, invert: Bool, TW: Bool = False, THREADS: Int = N // 2
+    N: Int, LT: TensorLayout, invert: Bool, TW: Bool = False,
+    THREADS: Int = N // 2, CG: Bool = False,
 ](
     re: TileTensor[DType.float32, LT, MutAnyOrigin],
     im: TileTensor[DType.float32, LT, MutAnyOrigin],
@@ -409,7 +526,14 @@ def fft_row_kernel[
     blocks and four elements at the load and the store, which doubles the
     blocks resident per SM (these blocks are capped by the SM's thread
     budget, not by registers or shared memory) without changing the shared
-    memory footprint. See optimizations.md sec. 5."""
+    memory footprint. See optimizations.md sec. 5.
+
+    `CG` switches the opening bit-reversed gather from global memory to
+    shared: the row is read coalesced and the permutation is done as a
+    shared-memory scatter, then `fft_lds_head` replaces the direct call to
+    `fft_warp_head`. See `fft_lds_head` for the mechanism and the cost. The
+    two paths are bit-identical -- the same values reach the same lanes in
+    the same order -- so `pixi run verify` polices the switch."""
     comptime assert re.flat_rank == 2, "expected (rows, N) tensor"
     comptime assert im.flat_rank == 2, "expected (rows, N) tensor"
     comptime log2n = ilog2_ct(N)
@@ -428,7 +552,20 @@ def fft_row_kernel[
     var t_im = stack_allocation[DType.float32, address_space=AddressSpace.SHARED](row_major[tw_alloc(N, TW)]())
     fill_twiddle_table[N, TW](t_re, t_im, tid, THREADS)
 
-    comptime if N >= 64 and WARP_SIZE == 32:
+    comptime if N >= 64 and WARP_SIZE == 32 and CG:
+        # Coalesced read, bit-reversed scatter into shared memory. Element
+        # `n` goes to `lds_swizzle(bit_reverse(n))`, which is where
+        # `fft_lds_head` expects to find it.
+        comptime for e in range(elems):
+            var n_ = tid + e * THREADS
+            var dst = lds_swizzle(bit_reverse_ct(n_, log2n))
+            s_re[dst] = rebind[Scalar[DType.float32]](re[row, n_])
+            s_im[dst] = rebind[Scalar[DType.float32]](im[row, n_])
+
+        fft_lds_head[N, invert, TW, THREADS](t_re, t_im, s_re, s_im, tid)
+
+        fft_lds_stages[N, 6, invert, TW, THREADS](t_re, t_im, s_re, s_im, tid)
+    elif N >= 64 and WARP_SIZE == 32:
         var warp = tid // 32
         var lane = tid % 32
         # One head block at a time rather than all `heads` at once, so the
@@ -481,25 +618,6 @@ def fft_row_kernel[
             var o = tid + e * THREADS
             re[row, o] = rebind[re.ElementType](s_re[o])
             im[row, o] = rebind[im.ElementType](s_im[o])
-
-
-def lds_swizzle(i: Int) -> Int:
-    """Index swizzle for the shared-memory buffer that
-    `fft_row_cmul_ifft_kernel` hands from its forward pass to its inverse
-    pass.
-
-    The inverse pass opens with a bit-reversed gather. Reading that gather
-    straight out of shared memory is a 32-way bank conflict: for `N = 2048`
-    (`log2n = 11`) the element warp `w` / lane `l` wants sits at
-    `bit_reverse(64*w + l) == 64*rev5(l) + rev5(w)`, so every lane in the
-    warp lands on bank `rev5(w)` -- the same one. Storing element `i` at
-    `i ^ ((i >> 6) & 31)` instead leaves the 64-element block an element
-    belongs to untouched (only bits 0-4 move) while making the gather's
-    bank `rev5(w) ^ rev5(l)`, which is distinct for every lane. The
-    permutation is an involution and a bijection within each 32-element
-    aligned block, so it is a pure relabelling of shared memory: nothing
-    about the arithmetic changes. For `N < 64` it is the identity."""
-    return i ^ ((i >> 6) & 31)
 
 
 def fft_row_cmul_ifft_kernel[
@@ -1845,7 +1963,7 @@ def rfft_w_div_transposed_gpu[
 
 def rfft2_batched_gpu_div_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4,
+    WDIV: Int = 4, CG: Bool = False,
 ](
     ctx: DeviceContext,
     mut a_buf: DeviceBuffer[DType.float32],
@@ -1865,7 +1983,7 @@ def rfft2_batched_gpu_div_t[
 
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,
@@ -2055,7 +2173,7 @@ def fft_col_cmul_ifft_gpu[
 
 def rfft2_batched_gpu_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4,
+    WDIV: Int = 4, CG: Bool = False,
 ](
     ctx: DeviceContext,
     mut x_buf: DeviceBuffer[DType.float32],
@@ -2075,7 +2193,7 @@ def rfft2_batched_gpu_t[
 
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), False, TW, HT, CG]
     ctx.enqueue_function[kernel_h](
         TileTensor(out_re, row_layout_h), TileTensor(out_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,
@@ -2084,7 +2202,7 @@ def rfft2_batched_gpu_t[
 
 def irfft2_batched_gpu_t[
     D: Int, H: Int, W: Int, TILE: Int, TW: Bool = False, TDIV: Int = 2,
-    WDIV: Int = 4,
+    WDIV: Int = 4, CG: Bool = False,
 ](
     ctx: DeviceContext,
     mut in_re: DeviceBuffer[DType.float32],
@@ -2099,7 +2217,7 @@ def irfft2_batched_gpu_t[
     comptime W2 = W // 2 + 1
     comptime HT = H // TDIV
     comptime row_layout_h = row_major[D * W2, H]()
-    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW, HT]
+    comptime kernel_h = fft_row_kernel[H, type_of(row_layout_h), True, TW, HT, CG]
     ctx.enqueue_function[kernel_h](
         TileTensor(in_re, row_layout_h), TileTensor(in_im, row_layout_h),
         grid_dim=D * W2, block_dim=HT,

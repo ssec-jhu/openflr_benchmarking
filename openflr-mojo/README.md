@@ -84,12 +84,12 @@ mojo run src/main.mojo -- v1 1 --dump out.bin   # single step, dump raw float32 
 pixi run verify                       # every arm vs the numpy reference, full scale
 ```
 
-Each run benchmarks four **arms** — compile-time configurations threaded
+Each run benchmarks five **arms** — compile-time configurations threaded
 from `main.mojo` down to the kernels, each giving some group of kernels a
 different block size — and prints one line each: `base` (the reference
-implementation), `t4w8`, `t4w8c4` and `t8w8c4`. `t4w8c4` is the fastest
-measured on the A100; `t8w8c4` is written and verified but not yet
-measured there. All four arms are bit-identical to each other by
+implementation), `t4w8`, `t4w8c4`, `t8w8c4` and `t4w8c4g`. `t4w8c4` is the
+fastest measured on the A100; the last two are written and verified but not
+yet measured there. All five arms are bit-identical to each other by
 construction — they only remap work across threads — and `pixi run verify`
 asserts it. See `optimizations.md` for what each knob sizes and which two
 arms are there as measurement controls rather than as candidates.

@@ -1,12 +1,11 @@
 # Optimization findings
 
 This file is a chronological log, oldest first. **Read this section, then
-skip to the last four `# Session:` headings** -- the first three of those are
-the only ones measured on an A100, and they overturn the priority order
-everything before them ends on; the fourth is the change currently awaiting
-an A100 measurement. The rest is history: correct on its own terms, measured
-on an AMD gfx1151 iGPU, and pointed at a different bottleneck than the target
-hardware has.
+skip to the last two `# Session:` headings** -- the profile and the session
+before it. Everything older than
+the `w8` session is history: correct on its own terms, measured on an AMD
+gfx1151 iGPU, and pointed at a different bottleneck than the target hardware
+has.
 
 ---
 
@@ -29,7 +28,11 @@ its gap has barely moved. Published in `../results.md`. On the gfx1151 iGPU
 the same code beats ROCm JAX by 1.8x and ROCm torch by 3.9x, so the kernels
 are not weak in general -- the remaining gap is A100-specific tuning.
 
-**Block size: one question left, and no rule.** Five changes measured:
+**Block size is spent, and occupancy is not the variable.** The profile
+measured `registersPerThread` per dispatch and closed this: `t4w8` really
+did take `rfft_row_kernel` from 4 to 6 blocks/SM and `irfft_row_mul_kernel`
+from 4 to 8, exactly as predicted, and bought 2.4% and 3.2%. Five changes
+measured:
 
 | step | measured |
 |---|---|
@@ -49,6 +52,29 @@ so far predicts which way. A rule based on each kernel's achieved bandwidth
 looked good on four points and then got the fifth's *sign* wrong -- see the
 `i8` session, and do not resurrect it. `t8w8c4` is the last block-size arm;
 if it does not win, the lever is finished.
+
+## Where v2's time actually goes (profiled, `t4w8c4`)
+
+| | us | % iter | % of peak bw |
+|---|---|---|---|
+| `ifft_row_cmul_broadcast` | 3056 | 22.4% | 22% |
+| `irfft_row_mul_kernel` | 2908 | 21.3% | 35% |
+| `fft_row_kernel` (H fwd) | 2048 | 15.0% | 33% |
+| `rfft_row_kernel` (W) | 1821 | 13.3% | 37% |
+| everything else (transposes, cmul, reduce, small) | 3835 | 28.0% | 69-87% |
+
+**The four FFT kernels are 71.9% of the iteration and JAX runs the whole
+thing in 11200 us: no arrangement of the other 28% closes the gap.** And the
+split is total -- every kernel with an FFT butterfly in it is at 22-37% of
+peak, every kernel without one is at 69-87%. Two populations, not a
+gradient. Launch gaps are 0.2%, so wall time and kernel time are the same
+measurement.
+
+The current best hypothesis for that split, with arithmetic behind it and
+an arm testing it, is the **bit-reversed opening gather**: it makes one
+warp's load touch 32 distinct 32-byte sectors where a coalesced load touches
+4. Cheap in DRAM traffic (the 8 KB rows stay in L1, which is why the byte
+model never saw it), expensive in L1 wavefronts. See the profile session.
 
 ## The one thing to internalise before optimising anything
 
@@ -91,14 +117,16 @@ pixi run test                                   # unit tests
 The four arms, selected by compile-time parameters threaded from
 `main.mojo` down to the kernels:
 
-| arm | `TDIV` | `WDIV` | `CDIV` | `IDIV` | what it is |
-|---|---|---|---|---|---|
-| `base` | 2 | 4 | 2 | 2 | bit-identical to commit `9da8abd`, before any of this |
-| `t4w8` | 4 | 8 | 2 | 4 | superseded, kept as the **cross-run anchor** |
-| `t4w8c4` | 4 | 8 | 4 | 4 | + 512-thread `fft_row_cmul_ifft` -- **best measured** |
-| `t8w8c4` | **8** | 8 | 4 | 4 | 256-thread `fft_row_kernel` alone -- **awaiting A100** |
+| arm | `TDIV` | `WDIV` | `CDIV` | `IDIV` | `CG` | what it is |
+|---|---|---|---|---|---|---|
+| `base` | 2 | 4 | 2 | 2 | F | bit-identical to commit `9da8abd`, before any of this |
+| `t4w8` | 4 | 8 | 2 | 4 | F | superseded, kept as the **cross-run anchor** |
+| `t4w8c4` | 4 | 8 | 4 | 4 | F | + 512-thread `fft_row_cmul_ifft` -- **best measured** |
+| `t8w8c4` | **8** | 8 | 4 | 4 | F | 256-thread `fft_row_kernel` alone -- awaiting A100 |
+| `t4w8c4g` | 4 | 8 | 4 | 4 | **T** | coalesced gather in `fft_row_kernel` -- **awaiting A100** |
 
-The knobs set block sizes: `TDIV` gives `fft_row_kernel` `H/TDIV` threads,
+`CG` is the one knob that is not a block size -- see the profile session.
+The rest are: `TDIV` gives `fft_row_kernel` `H/TDIV` threads,
 `WDIV` the four width-axis kernels `W/WDIV`, `CDIV` the fused
 forward-multiply-inverse column kernel `H/CDIV`, `IDIV`
 `ifft_row_cmul_broadcast_kernel` `H/IDIV`. All four arms are bit-identical to
@@ -122,25 +150,29 @@ twiddle table, sec. `tw`), `t8` (both column kernels at 256 threads),
 
 ## What must be done, in order
 
-**0. Re-profile v2.** This is now ahead of the remaining block-size arm, not
-behind it. v2 is +21.4% against JAX; its time has not been attributed since
-before `t4`, four block-size changes ago; and the last two attempts to pick a
-kernel from the stale profile plus a plausible rule produced a 5x magnitude
-miss and then a sign error. There is no substitute left for measuring. The
-`nsys` recipe and its three failure modes are in the traps list below;
-`registersPerThread` comes with it for free and would settle whether
-`t4w8`'s predicted 4 -> 6 blocks/SM ever happened -- the loose end from that
-session.
+**0. Measure `t4w8c4g` against `t4w8c4` on v2.** The coalesced-gather
+hypothesis, and the only idea currently on the table that is large enough to
+close v2's gap. `fft_row_kernel` is 2048 us of 13668; if the wavefront model
+holds it should roughly halve, i.e. -7% end to end. `t8w8c4` rides along in
+the same run and closes the last block-size question.
 
-**1. Measure `t8w8c4` against `t4w8c4`.** Cheap, rides along in the same
-benchmark run, and closes the last block-size question. Written, verified,
-bit-exact, iGPU-only so far. `pixi run mojo run src/main.mojo -- v2 20`.
+**1a. If `g` wins**, roll it out to `rfft_row_kernel`,
+`rfft_row_kernel_div`, `ifft_row_cmul_broadcast_kernel` and
+`irfft_row_into_lds` -- mechanical, and together they are 3x the kernel time
+`fft_row_kernel` is. Then re-profile.
 
-**2. Structural work on the FFT kernels, chosen from that profile.** They
-are ~75% of the v2 A100 iteration at 16-29% of peak bandwidth. The untried
-levers are shared-memory traffic and barriers per row -- radix-8 fused
-stages, or holding more of the transform in registers across stages -- not
-block size, which is spent.
+**1b. If `g` is flat or loses**, do not guess a replacement: point `ncu` at
+one dispatch of `fft_row_kernel` for
+`l1tex__t_sectors_pipe_lsu_mem_global_op_ld` and
+`smsp__sass_average_data_bytes_per_sector_mem_global_op_ld`, which measure
+the amplification directly rather than inferring it from index algebra, plus
+`dram__bytes_read` to finally validate the byte model this whole file has
+been using. Mind the `ncu` traps in the list below.
+
+**2. Other structural levers on the FFT kernels**, if the gather is not it:
+shared-memory traffic and barriers per row -- radix-8 fused stages, or
+holding more of the transform in registers across stages. Not block size,
+which is spent.
 
 **3. Get `t4` to 4 blocks/SM.** It currently gets 3: registers went 31 ->
 40 because the compiler hoists both head blocks' global loads together
@@ -2886,3 +2918,152 @@ which moves `fft_row_kernel` to 256 threads and leaves
 
 This is the last one. If `t8w8c4` does not win, block size is finished and
 nothing further should be spent on it.
+
+---
+
+# Session: the v2 A100 profile, re-taken — and what it says is wrong
+
+`v2prof.sqlite`, `nsys --trace=cuda` on the `t4w8c4` arm. The first
+re-attribution of v2 since before `t4`, and it settles two open questions
+and opens a much bigger one.
+
+## Read the trap first: an arm profile is 97% `base`
+
+`main.mojo`'s warmup loop is hard-coded to `run_v*_step_gpu[..., False, 2]`
+-- the `base` configuration -- and runs for 2 s of wall clock. Profiling
+`-- v2 3 t4w8c4` therefore captures **135 `base` iterations and 4 `t4w8c4`
+ones**. A `cuda_gpu_kern_sum` summary of that file describes `base`, not the
+arm you asked for, and averages the two together wherever a kernel is
+unchanged between them (same name hash, so the rows merge).
+
+Do not fix this by shortening the warmup -- the 2 s exists to cover this
+GPU's clock ramp and the harness section explains what breaks without it.
+Work per dispatch instead: order `CUPTI_ACTIVITY_KIND_KERNEL` by `start`,
+find the configuration switch, and take one complete iteration from each
+side of it. Which is a gift, because those two iterations are **adjacent, on
+identical clocks** -- the cleanest possible A/B, and exactly what the traps
+list says to construct by hand.
+
+## Question 1, settled: `t4w8` got the occupancy it predicted and it did not help
+
+`registersPerThread` and `blockX`, per dispatch, on the two sides of the
+switch:
+
+| kernel | base thr/reg | blk/SM | `t4w8c4` thr/reg | blk/SM | delta |
+|---|---|---|---|---|---|
+| `rfft_row_kernel` | 512 / 32 | 4 | 256 / 40 | **6** | **-2.4%** |
+| `irfft_row_mul_kernel` | 512 / 32 | 4 | 256 / 32 | **8** | **-3.2%** |
+| `fft_row_kernel` | 1024 / 31 | 2 | 512 / 40 | 3 | -17.6% |
+| `ifft_row_cmul_broadcast` | 1024 / 31 | 2 | 512 / 40 | 3 | -13.9% |
+
+The `w8` session predicted `rfft_row_kernel` would go 4 -> 6 blocks/SM and
+guessed a 3-5% end-to-end win. **The occupancy step happened exactly as
+predicted** -- 40 registers, 6 blocks -- and bought 2.4% on that kernel.
+`irfft_row_mul_kernel` did better still, a full 4 -> 8, and bought 3.2%.
+So the loose end is closed: those kernels were never occupancy-limited, and
+1.5-2x more resident blocks is worth ~3% to them. Meanwhile the two kernels
+that only reached 3 blocks/SM gained 14-18%. Occupancy is not the variable.
+
+Controls: `complex_mul_kernel` -0.0%, both big transposes +0.3%/+0.0%,
+`sum_over_depth_kernel` -0.2%. Everything unchanged agrees to 1.3%, so the
+changed kernels' numbers are trustworthy.
+
+## Question 2, settled: where v2's 13.6 ms goes
+
+One complete `t4w8c4` iteration, and the byte model per kernel:
+
+| kernel | us | % iter | thr/reg | blk/SM | GB/s | % of 2039 |
+|---|---|---|---|---|---|---|
+| `ifft_row_cmul_broadcast` | 3056 | 22.4% | 512/40 | 3 | 456 | **22%** |
+| `irfft_row_mul_kernel` | 2908 | 21.3% | 256/32 | 8 | 710 | **35%** |
+| `fft_row_kernel` (H fwd) | 2048 | 15.0% | 512/40 | 3 | 672 | **33%** |
+| `rfft_row_kernel` (W) | 1821 | 13.3% | 256/40 | 6 | 756 | **37%** |
+| `complex_mul_kernel` | 1162 | 8.5% | 256/18 | 8 | 1778 | 87% |
+| `transpose` (W2,H)->(H,W2) | 975 | 7.1% | 32/16 | - | 1413 | 69% |
+| `transpose` (H,W2)->(W2,H) | 942 | 6.9% | 32/16 | - | 1462 | 72% |
+| `sum_over_depth_kernel` | 440 | 3.2% | 256/28 | 8 | 1605 | 79% |
+| small (1,H,W) x 6 | 316 | 2.3% | | | | |
+| **total** | **13668** | | | | | |
+
+Two things to take from this:
+
+- **The four big FFT kernels are 9833 us -- 71.9% of the iteration.** JAX
+  runs the whole thing in 11200 us. There is no arrangement of the other
+  28% that closes the gap; the FFT kernels are the entire problem.
+- **The split is total.** Every kernel containing an FFT butterfly is at
+  22-37% of peak. Every kernel that does not is at 69-87%. That is not a
+  gradient, it is two populations, and the earlier A100 session saw the same
+  split (16-29% vs 62-87%) before any of this tuning.
+
+The iteration also has **no launch gaps at all** -- kernel time sums to
+13668 us against a 13696 us span, so 27 us (0.2%) of the wall clock is not
+inside a kernel. Nothing to win in dispatch overhead, and it means wall
+time and kernel time are the same measurement.
+
+## The open question, and a mechanism for it
+
+Why are the FFT kernels stuck at a third of peak while everything else
+reaches 70-90%? Occupancy is now definitively ruled out. Here is a candidate
+with arithmetic behind it, which the `g` arm tests.
+
+**Every one of these kernels opens with a bit-reversed gather from global
+memory, and it is a 32-way scatter.** For `fft_row_kernel` at `N = 2048`,
+lane `l` of warp `w` reads element `bit_reverse(64*w + l)`, and the index
+algebra gives `rev5(l)*64 + rev5(w)`: consecutive lanes land **64 elements
+= 256 bytes apart**. One warp's load therefore touches **32 distinct 32-byte
+sectors where a coalesced load touches 4**. Same for `rfft_row_kernel` at
+its internal length 1024 (stride 128 B, again 32 sectors). The *stores* are
+`o = tid + e*THREADS` and perfectly coalesced -- it is only the gather.
+
+The rows are small (8 KB) and stay in L1, so this costs little DRAM traffic
+-- which is exactly why the byte model has never seen it, and why the
+kernels look like they are "only" at a third of peak rather than saturated.
+What it costs is **L1 wavefronts**: at 8 scattered loads per thread and 32
+wavefronts apiece against a coalesced 4, at roughly one wavefront per cycle
+per SM, the load side alone accounts for on the order of 1 ms of
+`fft_row_kernel`'s 2.05 ms. That is a hypothesis with an order of magnitude
+attached, not a measurement -- but it is the only structural difference
+between the two populations in the table above that is not already ruled
+out.
+
+**The fix, in the `t4w8c4g` arm:** read the row coalesced, and do the
+bit-reversal as a *shared-memory* scatter instead. `lds_swizzle` -- which
+already exists for exactly this access pattern in
+`fft_row_cmul_ifft_kernel`'s inverse pass -- makes both the scatter and the
+subsequent gather bank-conflict-free (the algebra is in its docstring). The
+cost is two extra `barrier()`s and one shared round trip; the new
+`fft_lds_head` is `fft_warp_head` fed that way. Applied to `fft_row_kernel`
+only, as the cheapest decisive test: it is 15.0% of v2, and if the mechanism
+is right, rolling it out to the other three is mechanical and worth roughly
+three times as much.
+
+Arithmetic is unchanged -- the same values reach the same lanes in the same
+order -- so `pixi run verify` polices it, and it does.
+
+## What to run
+
+Five arms now (`base`, `t4w8`, `t4w8c4`, `t8w8c4`, `t4w8c4g`):
+
+```
+pixi run mojo run src/main.mojo -- v2 20
+pixi run mojo run src/main.mojo -- v1 20
+```
+
+- `t4w8` against 0.018465 (v1) / 0.013603 (v2) is the cross-run anchor.
+- **`t4w8c4g` vs `t4w8c4` on v2** is the mechanism test. `fft_row_kernel` is
+  2048 us of 13668; if the wavefront model is right it should roughly halve,
+  which is -7% end to end. Anything above about -3% is worth rolling out to
+  `rfft_row_kernel`, `ifft_row_cmul_broadcast_kernel` and
+  `irfft_row_into_lds`. Flat or negative kills the hypothesis, and the next
+  thing to try is `ncu` on one dispatch of `fft_row_kernel` for
+  `l1tex__t_sectors_pipe_lsu_mem_global_op_ld` and
+  `smsp__sass_average_data_bytes_per_sector_mem_global_op_ld` -- which
+  measures the amplification directly instead of inferring it from index
+  algebra. Mind the `ncu` traps: `--target-processes all`, a tiny
+  `--launch-count`, and never `--set full` on these grids.
+- `t8w8c4` vs `t4w8c4` closes the last block-size question (see the `i8`
+  session). Rides along; low expectations either way.
+
+v1 is +1.90% against JAX and effectively finished -- it dispatches
+`fft_row_kernel` only on the small (1,H,W) stages, so `g` barely touches it.
+Read v1 as a regression check, not as a result.

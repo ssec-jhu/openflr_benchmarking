@@ -10,9 +10,10 @@ Usage:
     mojo run main.mojo -- v2 1 t4 --dump out.bin   # one step, dumped
 
 Arms: `base` (the pre-flag kernels), `t4w8` (an intermediate kept as a
-cross-run check), `t4w8c4` (the best measured configuration) and `t8w8c4`,
-which drops `fft_row_kernel` alone to 256-thread blocks. All four are
-bit-identical: they only remap work across threads.
+cross-run check), `t4w8c4` (the best measured configuration), `t8w8c4`
+(`fft_row_kernel` alone at 256-thread blocks) and `t4w8c4g` (`fft_row_kernel`
+reading its row coalesced and doing the bit-reversal in shared memory). All
+five are bit-identical: they only remap work across threads and memory.
 """
 
 from std.sys import argv, has_accelerator, stderr
@@ -155,7 +156,8 @@ def main() raises:
         elif a == "--dump":
             i += 1
             dump_path = String(args[i])
-        elif a == "base" or a == "t4w8" or a == "t4w8c4" or a == "t8w8c4":
+        elif (a == "base" or a == "t4w8" or a == "t4w8c4"
+              or a == "t8w8c4" or a == "t4w8c4g"):
             arm = a
         else:
             n_iters = Int(a)
@@ -211,6 +213,16 @@ def main() raises:
     #                             and lost 4.3%, which implies this
     #                             configuration *gains* ~1.6%. Affects both
     #                             versions
+    #   t4w8c4g  + CG=True      -- `t4w8c4` with `fft_row_kernel`'s opening
+    #                             bit-reversed gather moved off global
+    #                             memory. That gather makes one warp's load
+    #                             touch 32 distinct 32-byte sectors where a
+    #                             coalesced one touches 4; reading the row
+    #                             coalesced and permuting it in shared
+    #                             memory instead costs two barriers and a
+    #                             shared round trip. Mostly a v2 arm -- v1
+    #                             dispatches this kernel only on the small
+    #                             (1,H,W) stages
     #
     # Retired after being measured and losing: `tw` (a shared twiddle
     # table), `t8` (both column kernels at 256 threads), `t4w16`
@@ -247,24 +259,27 @@ def main() raises:
             )
         ctx.synchronize()
 
-    comptime for arm_i in range(4):
+    comptime for arm_i in range(5):
         comptime TW = False
         comptime TDIV = 2 if arm_i == 0 else (8 if arm_i == 3 else 4)
         comptime WDIV = 4 if arm_i == 0 else 8
         comptime CDIV = 4 if arm_i >= 2 else 2
-        # Pinned to 4 on the last arm so `TDIV` moves `fft_row_kernel` and
-        # nothing else; everywhere else it tracks `TDIV`, as it always did.
+        # Pinned to 4 on the `t8w8c4` arm so `TDIV` moves `fft_row_kernel`
+        # and nothing else; everywhere else it tracks `TDIV`, as it always
+        # did.
         comptime IDIV = 4 if arm_i == 3 else TDIV
+        comptime CG = arm_i == 4
         comptime arm_name = "t4w8" if arm_i == 1 else (
-            "t4w8c4" if arm_i == 2 else ("t8w8c4" if arm_i == 3 else "base"))
+            "t4w8c4" if arm_i == 2 else ("t8w8c4" if arm_i == 3 else (
+                "t4w8c4g" if arm_i == 4 else "base")))
 
         if arm == "all" or arm == arm_name:
             if version == "v1":
-                run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV](
+                run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                 )
             else:
-                run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV](
+                run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
                     ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                 )
             ctx.synchronize()
@@ -279,11 +294,11 @@ def main() raises:
             for _ in range(n_iters):
                 var start = perf_counter_ns()
                 if version == "v1":
-                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV](
+                    run_v1_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v1_re, psft_v1_im, out_buf, scratch
                     )
                 else:
-                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV](
+                    run_v2_step_gpu[D, H, W, TILE, TW, TDIV, WDIV, CDIV, IDIV, CG](
                         ctx, data_buf, image_buf, psf_fft_re, psf_fft_im, psft_v2_re, psft_v2_im, out_buf, scratch
                     )
                 ctx.synchronize()
